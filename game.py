@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
 import tracemalloc
+from audioclock import AudioClock
 from streaming import (
     PlaylistController,
     PreparedMap,
@@ -70,17 +71,26 @@ class Game:
         self.map_chunks: deque[RuntimeMapChunk] = deque()
         self._active_chunk_signature = None
         self.active_map_chunk_count = 0
+        self.active_map_stream = None
         self.consecutive_skips = 0
         self.fps_smoothed = 0.0
+        self.audio_clock = AudioClock(pygame.mixer.music.get_pos)
 
     def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
         self.stop_playlist(recreate_controller=True)
         self.consecutive_skips = 0
         self.playlist.configure(songs, selected_index)
         Config.current_song = songs[selected_index]
-        result = self.start_song(screen)
+        try:
+            prepared = self.playlist.prepare_current([0.0, 0.0], [1, 1])
+            timed_audio = self.playlist.active_slot.audio_future.result(timeout=30)
+            initial_audio = (timed_audio.data, timed_audio.extension)
+        except Exception as exc:
+            return f"Unable to prepare initial stream: {exc}"
+        result = self.start_song(screen, prepared=prepared, audio_override=initial_audio)
         if result:
             return result
+        self.playlist.release_active_audio()
         self.auto_advance = len(songs) > 1
         pygame.mixer.music.set_endevent(TRACK_END_EVENT)
         self._prepare_next_song()
@@ -92,6 +102,7 @@ class Game:
             seamless: bool = False,
             audio_already_playing: bool = False,
             track_started_at: float = None,
+            audio_override: tuple[bytes, str] = None,
     ):
         random.seed(Config.seed)
         self.world = World()
@@ -100,6 +111,7 @@ class Game:
         self.safe_area_times = []
         self.map_chunks = deque()
         self._active_chunk_signature = None
+        self.active_map_stream = prepared.stream_slot if prepared is not None else None
         self.music_has_played = audio_already_playing
         self.offset_happened = seamless
         self.play_delay_ms = 0 if seamless else Config.start_playing_delay
@@ -133,11 +145,15 @@ class Game:
 
         if audio_already_playing:
             self.world.start_time = track_started_at or get_current_time()
+            self.audio_clock.start_now(self.world.start_time)
             self.world.square.pos = start_pos.copy()
             self.world.square.dir = start_dir.copy()
         else:
             try:
-                audio_data, extension = read_song_audio(song_to_spec(Config.current_song))
+                if audio_override is None:
+                    audio_data, extension = read_song_audio(song_to_spec(Config.current_song))
+                else:
+                    audio_data, extension = audio_override
                 self._load_music(audio_data, extension)
             except Exception as exc:
                 return f"Unable to load audio: {exc}"
@@ -151,6 +167,8 @@ class Game:
         self.world.future_bounces = deque(bounces)
         self.world.total_bounces = len(bounces)
         self.world.scorekeeper.unhit_notes = prepared.unhit_notes.copy()
+        self.active_map_stream = prepared.stream_slot
+        self.world.map_stream_complete = prepared.complete
         self.map_chunks = self._build_runtime_chunks(prepared)
         self._active_chunk_signature = None
         self._refresh_map_window(0.0, force=True)
@@ -176,6 +194,7 @@ class Game:
             })()]
 
         for chunk in source_chunks:
+            chunk_start_position = chunk.start_pos or previous_position
             runtime_chunks.append(RuntimeMapChunk(
                 start_time=chunk.start_time,
                 end_time=chunk.end_time,
@@ -185,7 +204,7 @@ class Game:
                 safe_areas=[],
                 safe_area_times=[],
                 bounce_data=list(chunk.bounces),
-                start_position=previous_position.copy(),
+                start_position=chunk_start_position.copy(),
                 materialized=False,
             ))
             if chunk.bounces:
@@ -235,6 +254,45 @@ class Game:
         self.safe_areas = [rect for chunk in active for rect in chunk.safe_areas]
         self.safe_area_times = [timestamp for chunk in active for timestamp in chunk.safe_area_times]
         self.world.rebuild_spatial_indexes(self.safe_areas)
+
+    def _ingest_stream_chunks(self, map_time: float):
+        if self.active_map_stream is None:
+            return
+        if self.active_map_stream.error:
+            error = self.active_map_stream.error
+            start_pos = self.world.square.pos.copy()
+            start_dir = self.world.square.dir.copy()
+            if start_dir == [0, 0]:
+                start_dir = [1, 1]
+            self.active_map_stream = None
+            self.world.map_stream_complete = True
+            if self.auto_advance:
+                self.playlist.prepare_ahead(start_pos, start_dir)
+            self.stream_message = f"Current map stream stopped safely: {error}"
+            return
+        horizon = map_time + float(Config.map_preload_seconds)
+        chunks = self.playlist.claim_chunks_until(self.active_map_stream, horizon)
+        if chunks:
+            for chunk in chunks:
+                new_bounces = [
+                    Bounce(position, direction, timestamp, axis)
+                    for position, direction, timestamp, axis in chunk.bounces
+                ]
+                self.world.future_bounces.extend(new_bounces)
+                self.world.total_bounces += len(new_bounces)
+                chunk_map = PreparedMap(
+                    bounces=list(chunk.bounces),
+                    unhit_notes=[],
+                    start_pos=(chunk.start_pos or self.world.square.pos).copy(),
+                    start_dir=(chunk.start_dir or self.world.square.dir).copy(),
+                    chunks=[chunk],
+                )
+                self.map_chunks.extend(self._build_runtime_chunks(chunk_map))
+            self._active_chunk_signature = None
+            self._refresh_map_window(map_time, force=True)
+
+        if self.playlist.stream_drained(self.active_map_stream):
+            self.world.map_stream_complete = True
 
     def _build_safe_areas(self, start_pos: list[float], time_offset: float = 0.0):
         previous = pygame.Rect(
@@ -321,6 +379,8 @@ class Game:
             if timestamp <= map_time
         ]
         self.world.future_bounces = deque(bounces)
+        self.world.map_stream_complete = True
+        self.active_map_stream = None
         self.world.scorekeeper.unhit_notes = prepared.unhit_notes.copy()
         self.world.total_bounces = self.world.completed_bounces + len(bounces)
 
@@ -395,6 +455,9 @@ class Game:
         self.stream_message = f"Skipped {name}: {reason}"
 
     def _update_playlist_transition(self):
+        if self.auto_advance:
+            end_pos, end_dir = self._end_state()
+            self.playlist.ensure_prefetch(end_pos, end_dir)
         self._queue_next_audio()
         if not self.transition_pending:
             return
@@ -422,12 +485,16 @@ class Game:
 
         queued_and_playing = self.next_audio_queued and pygame.mixer.music.get_busy()
         if queued_and_playing:
-            track_started_at = self.transition_started_at or now
+            track_started_at = self.audio_clock.start_from_transition(
+                self.transition_started_at or now,
+                Config.audio_clock_max_probe_ms,
+                now=now,
+            )
             self.current_audio_buffer = self.queued_audio_buffer
         else:
             self._load_music(audio_data, extension)
-            track_started_at = get_current_time()
             pygame.mixer.music.play()
+            track_started_at = self.audio_clock.start_now(get_current_time())
 
         transition = self.playlist.consume_prepared_map()
         if transition is None:
@@ -448,6 +515,7 @@ class Game:
         if result:
             self.stream_message = str(result)
             return
+        self.playlist.release_active_audio()
         self.transition_pending = False
         self.transition_wait_started_at = 0.0
         self.consecutive_skips = 0
@@ -518,6 +586,7 @@ class Game:
                 self.music_has_played = True
                 song_load_before = get_current_time()
                 pygame.mixer.music.play()
+                self.audio_clock.start_now(get_current_time())
                 for bnc_change in self.world.future_bounces:
                     bnc_change.time += get_current_time()-song_load_before
 
@@ -525,6 +594,11 @@ class Game:
 
         # set world time
         self.world.update_time()
+        if self.music_has_played:
+            self.world.time = self.audio_clock.position() + self.play_delay_ms / 1000
+            self.transition_lag_ms = abs(self.audio_clock.drift_ms)
+        map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
+        self._ingest_stream_chunks(map_time)
 
         # move camera (only works if not locked on square)
         self.camera.attempt_movement()
@@ -718,7 +792,7 @@ class Game:
             wait_ms = (get_current_time() - self.transition_wait_started_at) * 1000
         lines = (
             f"FPS {self.fps_smoothed:5.1f} | Python memory {memory_bytes / 1024 / 1024:5.1f} MB",
-            f"Chunks {self.active_map_chunk_count} | Pegs {len(self.world.rectangles)} | Particles {len(self.world.particles)}",
+            f"Chunks {self.active_map_chunk_count}+{metrics['buffered_chunks']} buffered | Pegs {len(self.world.rectangles)} | Particles {len(self.world.particles)}",
             f"Prefetch {metrics['ready']}/{metrics['queued']} | Map {metrics['map_ms']:.0f} ms | Audio {metrics['audio_ms']:.0f} ms",
             f"Prepare {metrics['pending_ms']:.0f} ms | Wait {wait_ms:.0f} ms | Sync {self.transition_lag_ms:.0f} ms",
         )

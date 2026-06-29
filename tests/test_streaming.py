@@ -1,6 +1,7 @@
 import os
 from io import BytesIO
-from time import time
+from time import monotonic, sleep, time
+from types import SimpleNamespace
 import unittest
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -9,6 +10,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 import pygame
 
 import game as game_module
+from audioclock import AudioClock
 from config import Config
 from game import Game
 from liveconfig import LiveConfigOverlay
@@ -107,19 +109,130 @@ class StreamingTests(unittest.TestCase):
             ]
             controller.configure(songs, 0)
             controller.prepare_ahead([0.0, 0.0], [1, 1])
-            for slot in controller.slots:
-                slot.map_future.result(timeout=30)
-                slot.audio_future.result(timeout=30)
+            first, second = controller.slots
+            first.map_future.result(timeout=30)
+            first_end = first.complete_future.result(timeout=30)
+            second.map_future.result(timeout=30)
+            second.audio_future.result(timeout=30)
 
             self.assertEqual([slot.index for slot in controller.slots], [1, 2])
             self.assertEqual(controller.ready_count(), 2)
-            first, second = controller.slots
-            self.assertEqual(second.map_future.result().start_pos, first.map_future.result().end_state[0])
-            self.assertEqual(second.map_future.result().start_dir, first.map_future.result().end_state[1])
+            self.assertEqual(second.map_future.result().start_pos, first_end[0])
+            self.assertEqual(second.map_future.result().start_dir, first_end[1])
         finally:
             controller.shutdown()
             Config.max_notes = previous_max_notes
             Config.playlist_prefetch_count = previous_prefetch
+
+    def test_map_stream_emits_chunks_incrementally_with_backpressure(self):
+        previous_max_notes = Config.max_notes
+        previous_chunk = Config.map_chunk_seconds
+        previous_buffer = Config.map_stream_buffer_chunks
+        Config.max_notes = 64
+        Config.map_chunk_seconds = 1
+        Config.map_stream_buffer_chunks = 2
+        controller = PlaylistController()
+        try:
+            song = make_song_from_zip("songs/tetris.zip")
+            controller.configure([song], 0)
+            prepared = controller.prepare_current([0.0, 0.0], [1, 1])
+            slot = controller.active_slot
+            deadline = monotonic() + 10
+            while len(slot.chunk_queue) < 2 and not slot.map_complete and monotonic() < deadline:
+                sleep(0.01)
+
+            self.assertEqual(len(prepared.chunks), 1)
+            self.assertLessEqual(len(slot.chunk_queue), 2)
+            self.assertFalse(slot.map_complete)
+
+            claimed_count = 1
+            while not controller.stream_drained(slot) and monotonic() < deadline:
+                claimed_count += len(controller.claim_chunks_until(slot, float("inf")))
+                sleep(0.01)
+
+            claimed_count += len(controller.claim_chunks_until(slot, float("inf")))
+            self.assertTrue(controller.stream_drained(slot))
+            self.assertGreater(claimed_count, 2)
+        finally:
+            controller.shutdown()
+            Config.max_notes = previous_max_notes
+            Config.map_chunk_seconds = previous_chunk
+            Config.map_stream_buffer_chunks = previous_buffer
+
+    def test_audio_clock_prefers_plausible_mixer_position(self):
+        now = [100.0]
+        mixer_ms = [250]
+        clock = AudioClock(lambda: mixer_ms[0], time_fn=lambda: now[0])
+        started_at = clock.start_from_transition(99.5, max_probe_ms=5000)
+        self.assertAlmostEqual(started_at, 99.75)
+
+        now[0] = 100.5
+        mixer_ms[0] = 750
+        self.assertAlmostEqual(clock.position(), 0.75)
+        self.assertTrue(clock.using_mixer)
+
+        mixer_ms[0] = 30_000
+        now[0] = 101.0
+        self.assertAlmostEqual(clock.position(), 1.25)
+        self.assertFalse(clock.using_mixer)
+
+    def test_game_ingests_stream_chunks_without_loading_full_geometry(self):
+        previous_max_notes = Config.max_notes
+        previous_chunk = Config.map_chunk_seconds
+        previous_buffer = Config.map_stream_buffer_chunks
+        original_update_screen = game_module.update_screen
+        Config.max_notes = 64
+        Config.map_chunk_seconds = 1
+        Config.map_stream_buffer_chunks = 2
+        game_module.update_screen = lambda *args, **kwargs: None
+        screen = pygame.display.get_surface()
+        Config.screen = screen
+        game = Game()
+        game.active = True
+        try:
+            song = make_song_from_zip("songs/tetris.zip")
+            self.assertIsNone(game.start_playlist([song], 0, screen))
+            initial_total = game.world.total_bounces
+            deadline = monotonic() + 10
+            while not game.active_map_stream.chunk_queue and monotonic() < deadline:
+                sleep(0.01)
+
+            game._ingest_stream_chunks(1.0)
+
+            self.assertGreater(game.world.total_bounces, initial_total)
+            self.assertGreater(len(game.map_chunks), 1)
+            self.assertLessEqual(len(game.active_map_stream.chunk_queue), 2)
+        finally:
+            game.shutdown()
+            game_module.update_screen = original_update_screen
+            Config.max_notes = previous_max_notes
+            Config.map_chunk_seconds = previous_chunk
+            Config.map_stream_buffer_chunks = previous_buffer
+
+    def test_world_does_not_stop_while_more_chunks_are_pending(self):
+        game = Game()
+        try:
+            game.world.future_bounces.append(
+                game_module.Bounce([10.0, 10.0], [-1, 1], 0.1, 0)
+            )
+            game.world.map_stream_complete = False
+            game.world.time = 1.0
+            game.world.handle_bouncing(game.world.square)
+            self.assertEqual(game.world.square.dir, [-1, 1])
+        finally:
+            game.shutdown()
+
+    def test_active_stream_failure_stops_map_safely(self):
+        game = Game()
+        try:
+            game.active_map_stream = SimpleNamespace(error="worker lost")
+            game.world.map_stream_complete = False
+            game._ingest_stream_chunks(1.0)
+            self.assertIsNone(game.active_map_stream)
+            self.assertTrue(game.world.map_stream_complete)
+            self.assertIn("stopped safely", game.stream_message)
+        finally:
+            game.shutdown()
 
     def test_multiple_real_mp3_assets_load_in_sequence(self):
         songs = [
@@ -203,6 +316,10 @@ class StreamingTests(unittest.TestCase):
             @staticmethod
             def first_ready():
                 return False
+
+            @staticmethod
+            def ensure_prefetch(*_args):
+                return None
 
             @staticmethod
             def metrics():

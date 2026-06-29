@@ -33,9 +33,11 @@ choosing a song starts a continuous playlist from that song. while the current s
 for the next two songs are prepared in the background. audio is queued only after its matching map is ready. a
 slow preparation waits safely at the transition, and a broken song is skipped without stopping the playlist.
 
-maps are grouped into time chunks and only the retention/preload window is materialized. old chunks and offscreen
-particles are removed, while a spatial hash limits collision and viewport queries. the performance HUD shows FPS,
-python memory, active chunks, pegs, particles, preparation time, transition wait, and synchronization delay.
+maps are generated incrementally in a worker process as time chunks. a bounded chunk buffer feeds only the
+retention/preload window into the live world; old chunks and offscreen particles are removed. a spatial hash limits
+collision and viewport queries. playback timing follows the mixer position when it is reliable and falls back to a
+monotonic wall clock. the performance HUD shows FPS, python memory, active/buffered chunks, pegs, particles,
+preparation time, transition wait, and measured synchronization drift.
 
 press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
 left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, and map retention can

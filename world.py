@@ -18,6 +18,7 @@ class World:
         self.past_bounces: list[Bounce] = []
         self.completed_bounces = 0
         self.total_bounces = 0
+        self.map_stream_complete = True
         self.start_time = 0
         self.time = 0
         self.rectangles: list[pygame.Rect] = []
@@ -77,7 +78,7 @@ class World:
                 self.add_bounce_particles(square.pos, changed)
 
             # stop square at end
-            if not self.future_bounces:
+            if not self.future_bounces and self.map_stream_complete:
                 square.dir = [0, 0]
                 square.pos = current_bounce.square_pos
 

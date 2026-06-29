@@ -2,7 +2,7 @@ from utils import *
 from menu import Menu
 from game import Game
 from configpage import ConfigPage
-from songselector import SongSelector
+from songselector import SongSelector, make_song_from_zip
 from errorscreen import ErrorScreen
 from liveconfig import LiveConfigOverlay
 from os import chdir, getcwd
@@ -14,11 +14,49 @@ import debuginfo
 import webbrowser
 import pygame
 from array import array
+from time import monotonic, sleep
+
+
+def set_resource_root():
+    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    chdir(resource_root)
+
+
+def run_stream_smoke_test() -> int:
+    """Exercise packaged multiprocessing map streaming without opening the full UI."""
+    set_resource_root()
+    pygame.init()
+    screen = pygame.display.set_mode((64, 64))
+    Config.screen = screen
+    previous = (Config.max_notes, Config.map_chunk_seconds, Config.map_stream_buffer_chunks)
+    Config.max_notes = 64
+    Config.map_chunk_seconds = 1
+    Config.map_stream_buffer_chunks = 2
+    game = Game()
+    game.active = True
+    try:
+        song = make_song_from_zip("songs/tetris.zip")
+        error = game.start_playlist([song], 0, screen)
+        if error:
+            raise RuntimeError(error)
+        slot = game.active_map_stream
+        deadline = monotonic() + 30
+        chunks_seen = 1
+        while not game.playlist.stream_drained(slot) and monotonic() < deadline:
+            chunks_seen += len(game.playlist.claim_chunks_until(slot, float("inf")))
+            sleep(0.01)
+        chunks_seen += len(game.playlist.claim_chunks_until(slot, float("inf")))
+        if not game.playlist.stream_drained(slot) or chunks_seen < 2:
+            raise RuntimeError("Packaged map stream did not complete")
+        return 0
+    finally:
+        game.shutdown()
+        Config.max_notes, Config.map_chunk_seconds, Config.map_stream_buffer_chunks = previous
+        pygame.quit()
 
 
 def main():
-    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    chdir(resource_root)
+    set_resource_root()
 
     # patch to fix mouse on high dpi displays
     if "Windows" in get_os():
@@ -242,4 +280,6 @@ def main():
 if __name__ == '__main__':
     from multiprocessing import freeze_support
     freeze_support()
+    if "--stream-smoke-test" in sys.argv:
+        raise SystemExit(run_stream_smoke_test())
     main()

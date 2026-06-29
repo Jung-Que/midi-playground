@@ -162,9 +162,11 @@ class Config:
     map_view_margin = 2.0
     map_chunk_seconds = 15
     map_preload_seconds = 30
+    map_stream_buffer_chunks = 8
     spatial_cell_size = 256
     playlist_prefetch_count = 2
     transition_wait_timeout_seconds = 20
+    audio_clock_max_probe_ms = 5000
     performance_hud = True
 
     # settings that are not configurable (yet)
