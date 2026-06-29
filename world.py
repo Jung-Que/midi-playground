@@ -7,6 +7,7 @@ from scorekeeper import Scorekeeper
 import random
 import pygame
 from collections import deque
+from spatial import SpatialHash
 
 
 class World:
@@ -25,7 +26,9 @@ class World:
         self.timestamps = []
         self.square = Square()
         self.scorekeeper = Scorekeeper(self)
-        self.colors = []           
+        self.colors = []
+        self.geometry_index = SpatialHash(Config.spatial_cell_size)
+        self.safe_area_index = SpatialHash(Config.spatial_cell_size)
 
     def update_time(self) -> None:
         self.time = get_current_time() - self.start_time
@@ -39,6 +42,20 @@ class World:
     def prune_past_bounces(self, retention_seconds: float):
         cutoff = self.time - retention_seconds
         self.past_bounces = [bounce for bounce in self.past_bounces if bounce.time >= cutoff]
+
+    def rebuild_spatial_indexes(self, safe_areas: list[pygame.Rect]):
+        self.geometry_index = SpatialHash(Config.spatial_cell_size)
+        self.safe_area_index = SpatialHash(Config.spatial_cell_size)
+        for index, rect in enumerate(self.rectangles):
+            self.geometry_index.insert(index, rect)
+        for index, rect in enumerate(safe_areas):
+            self.safe_area_index.insert(index, rect)
+
+    def visible_geometry(self, world_view: pygame.Rect) -> list[int]:
+        return sorted(self.geometry_index.query(world_view))
+
+    def visible_safe_areas(self, world_view: pygame.Rect) -> list[int]:
+        return sorted(self.safe_area_index.query(world_view))
 
     def add_bounce_particles(self, sp: list[float], sd: list[float]):
         for _ in range(Config.particle_amount):

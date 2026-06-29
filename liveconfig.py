@@ -19,6 +19,7 @@ class LiveConfigOverlay:
         ("Camera mode", "camera_mode"),
         ("Music volume", "volume"),
         ("Map retention", "map_retention_seconds"),
+        ("Performance HUD", "performance_hud"),
         ("Square speed (future)", "square_speed"),
         ("Bounce spacing (future)", "bounce_min_spacing"),
         ("Direction change (future)", "direction_change_chance"),
@@ -65,7 +66,7 @@ class LiveConfigOverlay:
             Config.theme = themes[(current_index + direction) % len(themes)]
         elif name in {
             "bounce_effect", "do_particles_on_bounce", "particle_trail",
-            "do_color_bounce_pegs", "square_glow",
+            "do_color_bounce_pegs", "square_glow", "performance_hud",
         }:
             setattr(Config, name, not bool(getattr(Config, name)))
         elif name == "glow_intensity":

@@ -1,4 +1,6 @@
 import os
+from io import BytesIO
+from time import time
 import unittest
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -11,7 +13,16 @@ from config import Config
 from game import Game
 from liveconfig import LiveConfigOverlay
 from songselector import make_song_from_zip
-from streaming import PlaylistController, map_settings_snapshot, prepare_song_map, song_to_spec
+from spatial import SpatialHash
+from streaming import (
+    MapChunk,
+    PlaylistController,
+    PreparedMap,
+    map_settings_snapshot,
+    prepare_song_map,
+    read_song_audio,
+    song_to_spec,
+)
 
 
 class StreamingTests(unittest.TestCase):
@@ -81,6 +92,184 @@ class StreamingTests(unittest.TestCase):
         finally:
             controller.shutdown()
             Config.max_notes = previous_max_notes
+
+    def test_playlist_prefetches_two_dependency_ordered_tracks(self):
+        previous_max_notes = Config.max_notes
+        previous_prefetch = Config.playlist_prefetch_count
+        Config.max_notes = 12
+        Config.playlist_prefetch_count = 2
+        controller = PlaylistController()
+        try:
+            songs = [
+                make_song_from_zip("songs/bad-piggies.zip"),
+                make_song_from_zip("songs/tetris.zip"),
+                make_song_from_zip("songs/rush-e.zip"),
+            ]
+            controller.configure(songs, 0)
+            controller.prepare_ahead([0.0, 0.0], [1, 1])
+            for slot in controller.slots:
+                slot.map_future.result(timeout=30)
+                slot.audio_future.result(timeout=30)
+
+            self.assertEqual([slot.index for slot in controller.slots], [1, 2])
+            self.assertEqual(controller.ready_count(), 2)
+            first, second = controller.slots
+            self.assertEqual(second.map_future.result().start_pos, first.map_future.result().end_state[0])
+            self.assertEqual(second.map_future.result().start_dir, first.map_future.result().end_state[1])
+        finally:
+            controller.shutdown()
+            Config.max_notes = previous_max_notes
+            Config.playlist_prefetch_count = previous_prefetch
+
+    def test_multiple_real_mp3_assets_load_in_sequence(self):
+        songs = [
+            make_song_from_zip("songs/calm_down.zip"),
+            make_song_from_zip("songs/wii_theme.zip"),
+        ]
+        for song in songs:
+            data, extension = read_song_audio(song_to_spec(song))
+            self.assertEqual(extension, ".mp3")
+            self.assertGreater(len(data), 1024)
+            pygame.mixer.music.load(BytesIO(data), namehint=extension)
+
+    def test_game_promotes_between_real_mp3_tracks(self):
+        previous_max_notes = Config.max_notes
+        original_update_screen = game_module.update_screen
+        Config.max_notes = 12
+        game_module.update_screen = lambda *args, **kwargs: None
+        screen = pygame.display.get_surface()
+        Config.screen = screen
+        songs = [
+            make_song_from_zip("songs/calm_down.zip"),
+            make_song_from_zip("songs/wii_theme.zip"),
+        ]
+        game = Game()
+        game.active = True
+        try:
+            self.assertIsNone(game.start_playlist(songs, 0, screen))
+            first_slot = game.playlist.slots[0]
+            first_slot.map_future.result(timeout=30)
+            first_slot.audio_future.result(timeout=30)
+            game.music_has_played = True
+            game._queue_next_audio()
+            pygame.mixer.music.stop()
+            game.transition_pending = True
+            game.transition_started_at = time()
+            game.transition_wait_started_at = game.transition_started_at
+
+            game._update_playlist_transition()
+
+            self.assertEqual(Config.current_song.name, songs[1].name)
+            self.assertFalse(game.transition_pending)
+            self.assertGreater(game.world.total_bounces, 0)
+        finally:
+            game.shutdown()
+            game_module.update_screen = original_update_screen
+            Config.max_notes = previous_max_notes
+
+    def test_failed_track_is_skipped_and_prefetch_continues(self):
+        previous_max_notes = Config.max_notes
+        Config.max_notes = 8
+        controller = PlaylistController()
+        try:
+            current = make_song_from_zip("songs/bad-piggies.zip")
+            broken = make_song_from_zip("songs/tetris.zip")
+            following = make_song_from_zip("songs/rush-e.zip")
+            broken.fp = "songs/does-not-exist.zip"
+            controller.configure([current, broken, following], 0)
+            controller.prepare_ahead([0.0, 0.0], [1, 1])
+            with self.assertRaises(Exception):
+                controller.map_future.result(timeout=30)
+            self.assertIn("failed", controller.first_error().lower())
+
+            skipped = controller.skip_failed([0.0, 0.0], [1, 1])
+
+            self.assertIs(skipped, broken)
+            self.assertEqual(controller.next_index, 2)
+        finally:
+            controller.shutdown()
+            Config.max_notes = previous_max_notes
+
+    def test_transition_waits_without_starting_an_unprepared_track(self):
+        class WaitingPlaylist:
+            songs = [object(), object()]
+            slots = [object()]
+            last_error = ""
+
+            @staticmethod
+            def first_error():
+                return ""
+
+            @staticmethod
+            def first_ready():
+                return False
+
+            @staticmethod
+            def metrics():
+                return {"ready": 0, "queued": 1, "pending_ms": 10, "map_ms": 0, "audio_ms": 0}
+
+            @staticmethod
+            def shutdown():
+                return None
+
+        game = Game()
+        game.playlist.shutdown()
+        game.playlist = WaitingPlaylist()
+        game.auto_advance = True
+        game.music_has_played = True
+        game.transition_pending = True
+        game.transition_wait_started_at = time()
+        try:
+            game._update_playlist_transition()
+            self.assertTrue(game.transition_pending)
+            self.assertIn("Preparing next track", game.stream_message)
+        finally:
+            game.shutdown()
+
+    def test_spatial_hash_limits_collision_candidates(self):
+        index = SpatialHash(cell_size=100)
+        index.insert("near", pygame.Rect(10, 10, 20, 20))
+        index.insert("far", pygame.Rect(1000, 1000, 20, 20))
+        self.assertEqual(index.query(pygame.Rect(0, 0, 50, 50)), {"near"})
+        index.remove("near")
+        self.assertEqual(index.query(pygame.Rect(0, 0, 50, 50)), set())
+
+    def test_hour_long_chunk_window_keeps_geometry_bounded(self):
+        previous_chunk = Config.map_chunk_seconds
+        previous_preload = Config.map_preload_seconds
+        previous_retention = Config.map_retention_seconds
+        Config.map_chunk_seconds = 15
+        Config.map_preload_seconds = 30
+        Config.map_retention_seconds = 5
+        bounces = []
+        chunks = []
+        for second in range(1, 3601):
+            bounce = ([float(second * 20), 0.0], [-1 if second % 2 else 1, 1], float(second), 0)
+            bounces.append(bounce)
+            chunk_start = int(second // 15) * 15
+            if not chunks or chunks[-1].start_time != chunk_start:
+                chunks.append(MapChunk(chunk_start, chunk_start + 15, []))
+            chunks[-1].bounces.append(bounce)
+        prepared = PreparedMap(
+            bounces=bounces,
+            unhit_notes=[float(value) for value in range(1, 3601)],
+            start_pos=[0.0, 0.0],
+            start_dir=[1, 1],
+            chunks=chunks,
+        )
+        game = Game()
+        try:
+            game._apply_prepared_map(prepared)
+            for map_time in range(0, 3601, 60):
+                game._refresh_map_window(float(map_time), force=True)
+                self.assertLessEqual(game.active_map_chunk_count, 4)
+                self.assertLessEqual(len(game.world.rectangles), 60)
+            self.assertLessEqual(len(game.map_chunks), 2)
+        finally:
+            game.shutdown()
+            Config.map_chunk_seconds = previous_chunk
+            Config.map_preload_seconds = previous_preload
+            Config.map_retention_seconds = previous_retention
 
     def test_game_starts_playlist_and_schedules_next_track(self):
         previous_max_notes = Config.max_notes

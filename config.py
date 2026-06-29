@@ -160,6 +160,12 @@ class Config:
     # rolling world
     map_retention_seconds = 5
     map_view_margin = 2.0
+    map_chunk_seconds = 15
+    map_preload_seconds = 30
+    spatial_cell_size = 256
+    playlist_prefetch_count = 2
+    transition_wait_timeout_seconds = 20
+    performance_hud = True
 
     # settings that are not configurable (yet)
     backtrack_chance: Optional[float] = 0.02
@@ -185,7 +191,7 @@ class Config:
                   "square_speed", "volume", "music_offset", "direction_change_chance", "hp_drain_rate", "theatre_mode",
                   "particle_trail", "shader_file_name", "do_color_bounce_pegs", 
                   "do_particles_on_bounce", "bounce_effect", "square_glow", "glow_intensity",
-                  "particle_amount", "map_retention_seconds", "language",
+                  "particle_amount", "map_retention_seconds", "performance_hud", "language",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
     # glow effect, for dark_modern only for now

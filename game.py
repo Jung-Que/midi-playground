@@ -8,7 +8,9 @@ from particle import Particle
 from bounce import Bounce
 from square import Square
 from collections import deque
+from dataclasses import dataclass, field
 from io import BytesIO
+import tracemalloc
 from streaming import (
     PlaylistController,
     PreparedMap,
@@ -21,6 +23,20 @@ from streaming import (
 
 
 TRACK_END_EVENT = pygame.USEREVENT + 17
+
+
+@dataclass
+class RuntimeMapChunk:
+    start_time: float
+    end_time: float
+    rectangles: list[pygame.Rect]
+    collision_times: list[float]
+    colors: list
+    safe_areas: list[pygame.Rect]
+    safe_area_times: list[float]
+    bounce_data: list[tuple[list[float], list[int], float, int]] = field(default_factory=list)
+    start_position: list[float] = field(default_factory=list)
+    materialized: bool = True
 
 
 class Game:
@@ -47,11 +63,19 @@ class Game:
         self.next_audio_queued = False
         self.transition_pending = False
         self.transition_started_at = 0.0
+        self.transition_wait_started_at = 0.0
+        self.transition_lag_ms = 0.0
         self.auto_advance = False
         self.stream_message = ""
+        self.map_chunks: deque[RuntimeMapChunk] = deque()
+        self._active_chunk_signature = None
+        self.active_map_chunk_count = 0
+        self.consecutive_skips = 0
+        self.fps_smoothed = 0.0
 
     def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
         self.stop_playlist(recreate_controller=True)
+        self.consecutive_skips = 0
         self.playlist.configure(songs, selected_index)
         Config.current_song = songs[selected_index]
         result = self.start_song(screen)
@@ -74,6 +98,8 @@ class Game:
         self.notes = []
         self.safe_areas = []
         self.safe_area_times = []
+        self.map_chunks = deque()
+        self._active_chunk_signature = None
         self.music_has_played = audio_already_playing
         self.offset_happened = seamless
         self.play_delay_ms = 0 if seamless else Config.start_playing_delay
@@ -105,8 +131,6 @@ class Game:
         if prepared.used_fallback:
             self.stream_message = prepared.warning or "Least-collision map fallback active"
 
-        self._build_safe_areas(start_pos)
-
         if audio_already_playing:
             self.world.start_time = track_started_at or get_current_time()
             self.world.square.pos = start_pos.copy()
@@ -127,10 +151,90 @@ class Game:
         self.world.future_bounces = deque(bounces)
         self.world.total_bounces = len(bounces)
         self.world.scorekeeper.unhit_notes = prepared.unhit_notes.copy()
-        self.world.rectangles = [bounce.get_collision_rect() for bounce in bounces]
-        self.world.collision_times = [bounce.time for bounce in bounces]
-        palette = [(224, 50, 50), (80, 210, 100), (230, 220, 50), (174, 170, 210), (245, 77, 247), (255, 153, 0)]
-        self.world.colors = [random.choice(palette) for _ in bounces]
+        self.map_chunks = self._build_runtime_chunks(prepared)
+        self._active_chunk_signature = None
+        self._refresh_map_window(0.0, force=True)
+
+    @staticmethod
+    def _square_rect(position: list[float]) -> pygame.Rect:
+        return pygame.Rect(
+            position[0] - Config.SQUARE_SIZE / 2,
+            position[1] - Config.SQUARE_SIZE / 2,
+            Config.SQUARE_SIZE,
+            Config.SQUARE_SIZE,
+        )
+
+    def _build_runtime_chunks(self, prepared: PreparedMap) -> deque[RuntimeMapChunk]:
+        runtime_chunks = deque()
+        previous_position = prepared.start_pos.copy()
+        source_chunks = prepared.chunks
+        if not source_chunks and prepared.bounces:
+            source_chunks = [type("MapChunkFallback", (), {
+                "start_time": prepared.bounces[0][2],
+                "end_time": prepared.bounces[-1][2],
+                "bounces": prepared.bounces,
+            })()]
+
+        for chunk in source_chunks:
+            runtime_chunks.append(RuntimeMapChunk(
+                start_time=chunk.start_time,
+                end_time=chunk.end_time,
+                rectangles=[],
+                collision_times=[],
+                colors=[],
+                safe_areas=[],
+                safe_area_times=[],
+                bounce_data=list(chunk.bounces),
+                start_position=previous_position.copy(),
+                materialized=False,
+            ))
+            if chunk.bounces:
+                previous_position = chunk.bounces[-1][0].copy()
+        return runtime_chunks
+
+    def _materialize_chunk(self, chunk: RuntimeMapChunk):
+        if chunk.materialized:
+            return
+        palette = [
+            (224, 50, 50), (80, 210, 100), (230, 220, 50),
+            (174, 170, 210), (245, 77, 247), (255, 153, 0),
+        ]
+        previous = self._square_rect(chunk.start_position)
+        for position, direction, timestamp, axis in chunk.bounce_data:
+            bounce = Bounce(position, direction, timestamp, axis)
+            target = self._square_rect(position)
+            chunk.rectangles.append(bounce.get_collision_rect())
+            chunk.collision_times.append(timestamp)
+            chunk.colors.append(random.choice(palette))
+            chunk.safe_areas.append(previous.union(target))
+            chunk.safe_area_times.append(timestamp)
+            previous = target
+        chunk.bounce_data = []
+        chunk.materialized = True
+
+    def _refresh_map_window(self, map_time: float, force: bool = False):
+        cutoff = map_time - float(Config.map_retention_seconds)
+        horizon = map_time + float(Config.map_preload_seconds)
+        while self.map_chunks and self.map_chunks[0].end_time < cutoff:
+            self.map_chunks.popleft()
+
+        active = [
+            chunk for chunk in self.map_chunks
+            if chunk.end_time >= cutoff and chunk.start_time <= horizon
+        ]
+        for chunk in active:
+            self._materialize_chunk(chunk)
+        signature = tuple((chunk.start_time, chunk.end_time, len(chunk.rectangles)) for chunk in active)
+        if not force and signature == self._active_chunk_signature:
+            return
+        self._active_chunk_signature = signature
+        self.active_map_chunk_count = len(active)
+        self.world.rectangles = [rect for chunk in active for rect in chunk.rectangles]
+        self.world.collision_times = [timestamp for chunk in active for timestamp in chunk.collision_times]
+        self.world.colors = [color for chunk in active for color in chunk.colors]
+        self.safe_areas = [rect for chunk in active for rect in chunk.safe_areas]
+        self.safe_area_times = [timestamp for chunk in active for timestamp in chunk.safe_area_times]
+        self.world.rebuild_spatial_indexes(self.safe_areas)
 
     def _build_safe_areas(self, start_pos: list[float], time_offset: float = 0.0):
         previous = pygame.Rect(
@@ -168,7 +272,10 @@ class Game:
         if not self.auto_advance:
             return
         start_pos, start_dir = self._end_state()
-        self.playlist.prepare_next(start_pos, start_dir)
+        if self.playlist.slots:
+            self.playlist.ensure_prefetch(start_pos, start_dir)
+        else:
+            self.playlist.prepare_ahead(start_pos, start_dir)
         self.next_audio_queued = False
         self.queued_audio_buffer = None
         self.unqueued_audio = None
@@ -201,7 +308,6 @@ class Game:
             return
 
         bounces = [Bounce(pos, direction, timestamp, axis) for pos, direction, timestamp, axis in prepared.bounces]
-        base_collision_times = [bounce.time for bounce in bounces]
         schedule_offset = self.play_delay_ms / 1000
         for bounce in bounces:
             bounce.time += schedule_offset
@@ -214,29 +320,48 @@ class Game:
             )
             if timestamp <= map_time
         ]
-        palette = [(224, 50, 50), (80, 210, 100), (230, 220, 50), (174, 170, 210), (245, 77, 247), (255, 153, 0)]
         self.world.future_bounces = deque(bounces)
         self.world.scorekeeper.unhit_notes = prepared.unhit_notes.copy()
         self.world.total_bounces = self.world.completed_bounces + len(bounces)
-        self.world.rectangles = [item[0] for item in past_geometry] + [bounce.get_collision_rect() for bounce in bounces]
-        self.world.collision_times = [item[1] for item in past_geometry] + base_collision_times
-        self.world.colors = [item[2] for item in past_geometry] + [random.choice(palette) for _ in bounces]
 
         past_safe_areas = [
             (rect, timestamp)
             for rect, timestamp in zip(self.safe_areas, self.safe_area_times)
             if timestamp <= map_time
         ]
-        self.safe_areas = [item[0] for item in past_safe_areas]
-        self.safe_area_times = [item[1] for item in past_safe_areas]
-        self._build_safe_areas(start_pos, time_offset=schedule_offset)
+        rebuilt_chunks = self._build_runtime_chunks(prepared)
+        self.map_chunks = deque()
+        if past_geometry or past_safe_areas:
+            retained_times = [item[1] for item in past_geometry] + [item[1] for item in past_safe_areas]
+            self.map_chunks.append(RuntimeMapChunk(
+                start_time=min(retained_times, default=map_time),
+                end_time=map_time,
+                rectangles=[item[0] for item in past_geometry],
+                collision_times=[item[1] for item in past_geometry],
+                colors=[item[2] for item in past_geometry],
+                safe_areas=[item[0] for item in past_safe_areas],
+                safe_area_times=[item[1] for item in past_safe_areas],
+            ))
+        self.map_chunks.extend(rebuilt_chunks)
+        self._active_chunk_signature = None
+        self._refresh_map_window(map_time, force=True)
 
         end_pos, end_dir = self._end_state()
         self.playlist.refresh_next_map(end_pos, end_dir)
         self.stream_message = "Future map updated"
 
     def _queue_next_audio(self):
-        if not self.auto_advance or self.next_audio_queued or not self.music_has_played:
+        if (
+                not self.auto_advance or self.next_audio_queued or
+                not self.music_has_played or self.transition_pending
+        ):
+            return
+        error = self.playlist.first_error()
+        if error:
+            self._skip_failed_next(error)
+            return
+        # Never queue audio before its collision map is ready.
+        if not self.playlist.first_ready():
             return
         audio = self.playlist.claim_audio()
         if audio is None:
@@ -249,16 +374,60 @@ class Game:
         except (TypeError, pygame.error):
             self.unqueued_audio = (audio_data, extension)
 
+    def _skip_failed_next(self, reason: str, restart_map_worker: bool = False):
+        start_pos, start_dir = self._end_state()
+        skipped = self.playlist.skip_failed(
+            start_pos,
+            start_dir,
+            restart_map_worker=restart_map_worker,
+        )
+        self.next_audio_queued = False
+        self.queued_audio_buffer = None
+        self.unqueued_audio = None
+        self.consecutive_skips += 1
+        if skipped is None or self.consecutive_skips >= len(self.playlist.songs):
+            self.auto_advance = False
+            self.transition_pending = False
+            self.stream_message = f"Playlist stopped: no playable next track ({reason})"
+            return
+        self.transition_wait_started_at = get_current_time()
+        name = getattr(skipped, "name", "track")
+        self.stream_message = f"Skipped {name}: {reason}"
+
     def _update_playlist_transition(self):
         self._queue_next_audio()
         if not self.transition_pending:
             return
 
-        if not pygame.mixer.music.get_busy() and self.unqueued_audio is not None:
-            audio_data, extension = self.unqueued_audio
+        error = self.playlist.first_error()
+        if error:
+            self._skip_failed_next(error)
+            return
+
+        now = get_current_time()
+        if not self.transition_wait_started_at:
+            self.transition_wait_started_at = now
+        waited = now - self.transition_wait_started_at
+        if not self.playlist.first_ready():
+            if waited > float(Config.transition_wait_timeout_seconds):
+                self._skip_failed_next("Preparation timed out", restart_map_worker=True)
+            else:
+                self.stream_message = f"Preparing next track... {waited:.1f}s"
+            return
+
+        audio = self.playlist.claim_audio()
+        if audio is None:
+            return
+        audio_data, extension = audio
+
+        queued_and_playing = self.next_audio_queued and pygame.mixer.music.get_busy()
+        if queued_and_playing:
+            track_started_at = self.transition_started_at or now
+            self.current_audio_buffer = self.queued_audio_buffer
+        else:
             self._load_music(audio_data, extension)
+            track_started_at = get_current_time()
             pygame.mixer.music.play()
-            self.transition_started_at = get_current_time()
 
         transition = self.playlist.consume_prepared_map()
         if transition is None:
@@ -268,24 +437,26 @@ class Game:
 
         _, song, prepared = transition
         Config.current_song = song
-        if self.next_audio_queued and self.queued_audio_buffer is not None:
-            self.current_audio_buffer = self.queued_audio_buffer
+        self.transition_lag_ms = max(0.0, (get_current_time() - track_started_at) * 1000)
         result = self.start_song(
             Config.screen,
             prepared=prepared,
             seamless=True,
-            audio_already_playing=pygame.mixer.music.get_busy(),
-            track_started_at=self.transition_started_at,
+            audio_already_playing=True,
+            track_started_at=track_started_at,
         )
         if result:
             self.stream_message = str(result)
             return
         self.transition_pending = False
+        self.transition_wait_started_at = 0.0
+        self.consecutive_skips = 0
         self._prepare_next_song()
 
     def stop_playlist(self, recreate_controller: bool = False):
         self.auto_advance = False
         self.transition_pending = False
+        self.transition_wait_started_at = 0.0
         pygame.mixer.music.set_endevent()
         if recreate_controller:
             self.playlist.shutdown()
@@ -298,6 +469,11 @@ class Game:
     def _prune_rolling_world(self, screen_rect: pygame.Rect):
         retention = float(Config.map_retention_seconds)
         map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
+        if self.map_chunks:
+            self._refresh_map_window(map_time)
+            self.world.prune_past_bounces(retention)
+            return
+
         cutoff = map_time - retention
         margin = max(float(Config.map_view_margin), 0.0)
         expanded_view = screen_rect.inflate(
@@ -323,6 +499,7 @@ class Game:
                 kept_safe_areas.append((rect, area_time))
         self.safe_areas = [item[0] for item in kept_safe_areas]
         self.safe_area_times = [item[1] for item in kept_safe_areas]
+        self.world.rebuild_spatial_indexes(self.safe_areas)
         self.world.prune_past_bounces(retention)
 
     def draw(self, screen: pygame.Surface, n_frames: int):
@@ -363,6 +540,7 @@ class Game:
             self.camera.follow(self.world.square)
 
         self._prune_rolling_world(screen_rect)
+        world_view = screen_rect.move(int(self.camera.x), int(self.camera.y))
 
         # bounce anim
         sqrect = self.camera.offset(self.world.square.rect)
@@ -376,14 +554,16 @@ class Game:
 
         # safe areas
         total_rects = 0
-        for safe_area in self.safe_areas:
+        for safe_index in self.world.visible_safe_areas(world_view):
+            safe_area = self.safe_areas[safe_index]
             offsetted = self.camera.offset(safe_area)
             if screen_rect.colliderect(offsetted):
                 total_rects += 1
                 pygame.draw.rect(screen, get_colors()["hallway"], offsetted)
 
         # draw pegs
-        for i, bounce_rect in enumerate(self.world.rectangles):
+        for i in self.world.visible_geometry(world_view):
+            bounce_rect = self.world.rectangles[i]
             offsetted = self.camera.offset(bounce_rect)
 
             if offsetted.colliderect(screen_rect):
@@ -394,10 +574,17 @@ class Game:
                     pygame.draw.rect(screen, get_colors()["background"], offsetted)
 
         # particles
+        particle_view = screen_rect.inflate(screen_rect.width, screen_rect.height)
+        alive_particles = []
         for particle in self.world.particles:
-            pygame.draw.rect(screen, particle.color, self.camera.offset(particle.rect))
-        for remove_particle in [particle for particle in self.world.particles if particle.age()]:
-            self.world.particles.remove(remove_particle)
+            expired = particle.age()
+            offsetted = self.camera.offset(particle.rect)
+            if expired or not particle_view.colliderect(offsetted):
+                continue
+            alive_particles.append(particle)
+            if screen_rect.colliderect(offsetted):
+                pygame.draw.rect(screen, particle.color, offsetted)
+        self.world.particles = alive_particles
 
         # particle trail in game
         if Config.particle_trail:
@@ -511,10 +698,47 @@ class Game:
             stream_surface = get_font(18).render(self.stream_message, True, (255, 190, 80))
             screen.blit(stream_surface, stream_surface.get_rect(midtop=(Config.SCREEN_WIDTH / 2, 12)))
 
+        self._draw_performance_hud(screen)
+
+    def _draw_performance_hud(self, screen: pygame.Surface):
+        instant_fps = 1.0 / max(float(Config.dt), 0.0001)
+        if self.fps_smoothed <= 0:
+            self.fps_smoothed = instant_fps
+        else:
+            self.fps_smoothed = self.fps_smoothed * 0.9 + instant_fps * 0.1
+        if not Config.performance_hud:
+            return
+
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+        memory_bytes, _ = tracemalloc.get_traced_memory()
+        metrics = self.playlist.metrics()
+        wait_ms = 0.0
+        if self.transition_pending and self.transition_wait_started_at:
+            wait_ms = (get_current_time() - self.transition_wait_started_at) * 1000
+        lines = (
+            f"FPS {self.fps_smoothed:5.1f} | Python memory {memory_bytes / 1024 / 1024:5.1f} MB",
+            f"Chunks {self.active_map_chunk_count} | Pegs {len(self.world.rectangles)} | Particles {len(self.world.particles)}",
+            f"Prefetch {metrics['ready']}/{metrics['queued']} | Map {metrics['map_ms']:.0f} ms | Audio {metrics['audio_ms']:.0f} ms",
+            f"Prepare {metrics['pending_ms']:.0f} ms | Wait {wait_ms:.0f} ms | Sync {self.transition_lag_ms:.0f} ms",
+        )
+        font = get_font(15)
+        surfaces = [font.render(line, True, (220, 230, 238)) for line in lines]
+        width = max(surface.get_width() for surface in surfaces) + 20
+        height = sum(surface.get_height() for surface in surfaces) + 14
+        panel = pygame.Surface((width, height), pygame.SRCALPHA)
+        panel.fill((5, 8, 12, 185))
+        y = 7
+        for surface in surfaces:
+            panel.blit(surface, (10, y))
+            y += surface.get_height()
+        screen.blit(panel, panel.get_rect(bottomright=(screen.get_width() - 12, screen.get_height() - 12)))
+
     def handle_event(self, event: pygame.event.Event):
         if event.type == TRACK_END_EVENT and self.active and self.auto_advance:
             self.transition_pending = True
             self.transition_started_at = get_current_time()
+            self.transition_wait_started_at = self.transition_started_at
             return False
 
         if not self.active:

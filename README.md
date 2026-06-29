@@ -29,9 +29,13 @@ start program with `python3 main.py`
 
 ## continuous playback and live settings
 
-choosing a song starts a continuous playlist from that song. while the current song is playing, the next song's
-map is generated in a worker process and its audio is prepared for the mixer queue. old map geometry is removed
-after it is both behind the playback time and outside the expanded camera view.
+choosing a song starts a continuous playlist from that song. while the current song is playing, maps and audio
+for the next two songs are prepared in the background. audio is queued only after its matching map is ready. a
+slow preparation waits safely at the transition, and a broken song is skipped without stopping the playlist.
+
+maps are grouped into time chunks and only the retention/preload window is materialized. old chunks and offscreen
+particles are removed, while a spatial hash limits collision and viewport queries. the performance HUD shows FPS,
+python memory, active chunks, pegs, particles, preparation time, transition wait, and synchronization delay.
 
 press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
 left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, and map retention can
