@@ -1,5 +1,6 @@
 from utils import *
 from square import Square
+from math import exp
 
 
 class Camera:
@@ -12,7 +13,7 @@ class Camera:
         self.bx = 0
         self.by = 0
         self.locked_on_square = True
-        self.lock_type: CameraFollow = CameraFollow(2)
+        self.lock_type: CameraFollow = get_camera_follow(Config.camera_mode)
 
     def attempt_movement(self):
         if not self.locked_on_square:
@@ -35,7 +36,7 @@ class Camera:
         else:
             return [pos_or_rect[0]-self.x, pos_or_rect[1]-self.y]
 
-    def follow(self, square: Square):
+    def follow(self, square: Square, target=None):
 
         # square in center
         if self.lock_type == CameraFollow.Center:
@@ -68,3 +69,25 @@ class Camera:
             self.by = square.y - damping * (self.ay - square.y) - Config.SCREEN_HEIGHT / 2 - Config.SCREEN_HEIGHT / 2 * damping
             self.x = self.x*(1-3*Config.dt)+self.bx*3*Config.dt
             self.y = self.y*(1-3*Config.dt)+self.by*3*Config.dt
+
+        if self.lock_type == CameraFollow.TargetLead:
+            focus_x = square.x
+            focus_y = square.y
+            if target is not None:
+                lead_x = (target[0] - square.x) * float(Config.camera_target_lead)
+                lead_y = (target[1] - square.y) * float(Config.camera_target_lead)
+                max_x = Config.SCREEN_WIDTH * float(Config.camera_max_lead_ratio)
+                max_y = Config.SCREEN_HEIGHT * float(Config.camera_max_lead_ratio)
+                focus_x += max(-max_x, min(max_x, lead_x))
+                focus_y += max(-max_y, min(max_y, lead_y))
+
+            desired_x = focus_x - Config.SCREEN_WIDTH / 2
+            desired_y = focus_y - Config.SCREEN_HEIGHT / 2
+            dt = max(float(Config.dt), 0.0)
+            smoothing = max(float(Config.camera_smoothing_seconds), 0.001)
+            alpha = 1.0 - exp(-dt / smoothing)
+            max_step = max(float(Config.camera_max_speed), 1.0) * dt
+            step_x = max(-max_step, min(max_step, (desired_x - self.x) * alpha))
+            step_y = max(-max_step, min(max_step, (desired_y - self.y) * alpha))
+            self.x += step_x
+            self.y += step_y

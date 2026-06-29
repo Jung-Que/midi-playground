@@ -5,3 +5,6 @@ __pycache__
 assets/settings.json
 dist
 main.spec
+/songs-local/
+/imports-local/
+/exports/

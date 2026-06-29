@@ -1,6 +1,6 @@
 from utils import *
 from os import listdir
-from os.path import isfile, join
+from os.path import isdir, isfile, join
 from zipfile import ZipFile
 from typing import Any
 from io import BytesIO
@@ -11,7 +11,7 @@ import pygame
 class Song:
     def __init__(self, name: str, song_artist: str, mapper: str,
                  song_file: str, audio_file: str, version: int = -1, filepath: Optional[str] = None,
-                 is_from_osu_file: bool = False):
+                 is_from_osu_file: bool = False, local_only: bool = False):
         self.is_from_osu_file = is_from_osu_file
         self.song_file_name: str = song_file
         self.audio_file_name: str = audio_file if audio_file is not None else self.song_file_name
@@ -21,6 +21,7 @@ class Song:
         self.name = name
         self.version = version  # metadata format version, not the map version
         self.music_offset = 0  # put integer that represents milliseconds, negative is music is before
+        self.local_only = local_only
 
         self.anim = 0
         col = pygame.Color(229, 97, 196)
@@ -42,8 +43,13 @@ class Song:
         overlay_surf.blit(title_surface, title_surface.get_rect(topright=overlay_surf.get_rect().topright).move(-20, 20))
 
         if not is_from_osu_file:
+            local_label = "[LOCAL ONLY] " if self.local_only else ""
             details_surface: pygame.Surface = get_font(
-                24).render(f"Song by {self.song_artist} | Mapped by {self.mapper}", True, (0, 0, 0))
+                24).render(
+                    f"{local_label}Song by {self.song_artist} | Mapped by {self.mapper}",
+                    True,
+                    (0, 0, 0),
+                )
         else:
             details_surface: pygame.Surface = get_font(24).render(f"WARNING: EXPERIMENTAL!!!", True, (0, 0, 0))
         overlay_surf.blit(details_surface, details_surface.get_rect(bottomright=overlay_surf.get_rect().bottomright).move(-20, -20))
@@ -57,7 +63,9 @@ class Song:
         return f"<Song({self.song_file_name}, audio={self.audio_file_name})>"
 
 
-def song_from_osu_file(contents: str, songfilepath: str, zipfilepath: str) -> Song:
+def song_from_osu_file(
+        contents: str, songfilepath: str, zipfilepath: str, local_only: bool = False
+) -> Song:
     audio_name = ""
     name = ""
     artist = ""
@@ -79,21 +87,26 @@ def song_from_osu_file(contents: str, songfilepath: str, zipfilepath: str) -> So
     return Song(
         name=name, song_artist=artist, mapper=mapper,
         song_file=songfilepath, audio_file=audio_name,
-        version=-2, filepath=zipfilepath, is_from_osu_file=True
+        version=-2, filepath=zipfilepath, is_from_osu_file=True, local_only=local_only
     )
 
 
-def make_songs_from_osz(fpath: str) -> list[Song]:
+def make_songs_from_osz(fpath: str, local_only: bool = False) -> list[Song]:
     songs = []
     with ZipFile(fpath) as zf:
         files = zf.filelist
         for fileinfo in files:
             if fileinfo.filename.endswith(".osu"):
-                songs.append(song_from_osu_file(zf.read(fileinfo.filename).decode('utf-8'), fileinfo.filename, fpath))
+                songs.append(song_from_osu_file(
+                    zf.read(fileinfo.filename).decode('utf-8'),
+                    fileinfo.filename,
+                    fpath,
+                    local_only=local_only,
+                ))
     return songs
 
 
-def make_song_from_zip(fpath: str) -> Song:
+def make_song_from_zip(fpath: str, local_only: bool = False) -> Song:
     with ZipFile(fpath) as zf:
         metadata_info = zf.getinfo("metadata.json")
         metadata: dict[str, Any] = loads(zf.read(metadata_info))
@@ -113,13 +126,23 @@ def make_song_from_zip(fpath: str) -> Song:
         audio_file = metadata.get("audio_file")
         song_file = metadata.get("song_file")
         version = metadata.get("version", -1)
-        new_song = Song(name, audio_file=audio_file, song_file=song_file, song_artist=artist, mapper=mapper, version=version, filepath=fpath)
+        new_song = Song(
+            name,
+            audio_file=audio_file,
+            song_file=song_file,
+            song_artist=artist,
+            mapper=mapper,
+            version=version,
+            filepath=fpath,
+            local_only=local_only,
+        )
         if metadata.get("version") >= 2:
             new_song.music_offset = metadata.get("music_offset", 0)
         return new_song
 
 
 class SongSelector:
+    SONG_DIRECTORIES = ("songs-local", "songs")
     ITEM_HEIGHT = 140
     ITEM_SPACING = 10
     SCROLL_SPEED = 20
@@ -139,13 +162,17 @@ class SongSelector:
 
     def reload_songs(self):
         self.songs = []
-        for song_name in reversed(listdir("songs")):
-            path = join("songs", song_name)
-            if isfile(path):
-                if path.lower().endswith(".zip") or path.lower().endswith(".midiplayground"):
-                    self.songs.append(make_song_from_zip(path))
-                if path.lower().endswith(".osz"):
-                    self.songs.extend(make_songs_from_osz(path))
+        for directory in self.SONG_DIRECTORIES:
+            if not isdir(directory):
+                continue
+            local_only = directory == "songs-local"
+            for song_name in reversed(listdir(directory)):
+                path = join(directory, song_name)
+                if isfile(path):
+                    if path.lower().endswith(".zip") or path.lower().endswith(".midiplayground"):
+                        self.songs.append(make_song_from_zip(path, local_only=local_only))
+                    if path.lower().endswith(".osz"):
+                        self.songs.extend(make_songs_from_osz(path, local_only=local_only))
 
     def get_song_rect(self, index: int):
         rect = pygame.Rect(

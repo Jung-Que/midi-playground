@@ -5,6 +5,16 @@ from os import listdir
 import webbrowser
 
 
+CAMERA_MODE_LABELS = {
+    CameraFollow.Center: "Center",
+    CameraFollow.Lazy: "Lazy",
+    CameraFollow.Smoothed: "Smoothed",
+    CameraFollow.Predictive: "Predictive",
+    CameraFollow.TargetLead: "Target Lead (Default)",
+}
+CAMERA_LABEL_MODES = {label: mode for mode, label in CAMERA_MODE_LABELS.items()}
+
+
 class ConfigPage:
     @property
     def made_with_pgui_rect(self):
@@ -25,10 +35,12 @@ class ConfigPage:
 
         # all attributes matching /s_.+/ are "s"ettings
 
+        camera_mode = get_camera_follow(Config.camera_mode)
+        Config.camera_mode = camera_mode.value
         self.s_camera_mode = pgui.elements.UIDropDownMenu(
-            ["Center", "Lazy", "Smoothed (Default)", "Predictive"],
+            list(CAMERA_MODE_LABELS.values()),
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH // 10, Config.SCREEN_HEIGHT // 10, 300, 30)),
-            starting_option=["Center", "Lazy", "Smoothed (Default)", "Predictive"][Config.camera_mode],
+            starting_option=CAMERA_MODE_LABELS[camera_mode],
             manager=self.ui_manager
         )
         self.s_camera_mode_label = pgui.elements.UILabel(
@@ -272,10 +284,11 @@ class ConfigPage:
                 Config.seed = None
                 self.s_seed.set_text("")
 
-                Config.camera_mode = 2
-                self.s_camera_mode.selected_option = "Smoothed (Default)"
+                Config.camera_mode = CameraFollow.TargetLead.value
+                camera_label = CAMERA_MODE_LABELS[CameraFollow.TargetLead]
+                self.s_camera_mode.selected_option = camera_label
                 self.s_camera_mode.current_state.finish()
-                self.s_camera_mode.current_state.selected_option = "Smoothed (Default)"
+                self.s_camera_mode.current_state.selected_option = camera_label
                 self.s_camera_mode.current_state.start()
 
                 Config.start_playing_delay = 3000
@@ -343,7 +356,7 @@ class ConfigPage:
         if event.type == pgui.UI_DROP_DOWN_MENU_CHANGED:
             play_sound("wood.wav")
             if event.ui_element == self.s_camera_mode:
-                Config.camera_mode = "CLSP".index(event.text[0])
+                Config.camera_mode = CAMERA_LABEL_MODES[event.text].value
             if event.ui_element == self.s_color_theme:
                 Config.theme = event.text
             if event.ui_element == self.s_theatre_mode:

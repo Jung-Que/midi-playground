@@ -58,9 +58,23 @@ class World:
     def visible_safe_areas(self, world_view: pygame.Rect) -> list[int]:
         return sorted(self.safe_area_index.query(world_view))
 
-    def add_bounce_particles(self, sp: list[float], sd: list[float]):
-        for _ in range(Config.particle_amount):
-            new = Particle([sp[0]+random.randint(-10, 10), sp[1]+random.randint(-10, 10)], sd)
+    def add_bounce_particles(self, sp: list[float], sd: list[float], bounce_time: float = 0.0):
+        local_rate = sum(
+            bounce.time <= bounce_time + 1.0 for bounce in self.future_bounces
+        )
+        adaptive_amount = max(4, min(10, round(12 - local_rate * 0.45)))
+        remaining_budget = max(int(Config.particle_max_active) - len(self.particles), 0)
+        amount = min(int(Config.particle_amount), adaptive_amount, remaining_budget)
+        accent = get_colors()["square"][self.completed_bounces % len(get_colors()["square"])]
+        for _ in range(amount):
+            new = Particle(
+                [sp[0] + random.randint(-8, 8), sp[1] + random.randint(-8, 8)],
+                sd,
+                color=accent,
+                lifetime=Config.particle_bounce_lifetime,
+                size_range=(3, 8),
+                speed_scale=0.75,
+            )
             self.particles.append(new)
 
     def handle_bouncing(self, square: Square):
@@ -75,7 +89,7 @@ class World:
                 else:
                     changed[axis] = -changed[axis]
             if Config.do_particles_on_bounce:
-                self.add_bounce_particles(square.pos, changed)
+                self.add_bounce_particles(square.pos, changed, current_bounce.time)
 
             # stop square at end
             if not self.future_bounces and self.map_stream_complete:

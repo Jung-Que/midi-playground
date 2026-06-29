@@ -70,9 +70,21 @@ class Square:
         return True
 
     def compute_glowy_surface(self, rect, val):
-        glowy_borders = make_glowy2((rect.size[0] + 40, rect.size[1] + 40), Color(Config.glow_color), val)
+        level = max(1, int(round(val / 3) * 3))
+        key = (rect.width, rect.height, level, tuple(Color(Config.glow_color)))
+        cached = self.glowy_surfaces.get(key)
+        if cached is not None:
+            return cached
+        glowy_borders = make_glowy2(
+            (rect.size[0] + 40, rect.size[1] + 40),
+            Color(Config.glow_color),
+            level,
+        )
         surface = pygame.Surface(rect.inflate(100, 100).size, pygame.SRCALPHA)
         surface.blit(glowy_borders, (20, 20), special_flags=pygame.BLEND_RGBA_ADD)
+        if len(self.glowy_surfaces) >= 32:
+            self.glowy_surfaces.clear()
+        self.glowy_surfaces[key] = surface
         return surface
 
     def draw_glowing3(self, win, rect):
@@ -91,19 +103,62 @@ class Square:
 
             win.blit(surf, rect.move(-40, -40).topleft, special_flags=pygame.BLEND_RGBA_ADD)
 
+    def accent_color(self):
+        palette = get_colors()["square"]
+        square_color_index = round((self.dir_x + 1) / 2 + self.dir_y + 1)
+        return pygame.Color(palette[square_color_index % len(palette)])
+
+    def _draw_neon_core(self, screen: pygame.Surface, sqrect: pygame.Rect):
+        accent = self.accent_color()
+        background = pygame.Color(get_colors()["background"])
+        core = background.lerp(pygame.Color(5, 7, 10), 0.45)
+        border_radius = max(2, min(sqrect.width, sqrect.height) // 7)
+
+        pygame.draw.rect(screen, accent, sqrect, border_radius=border_radius)
+        inner = sqrect.inflate(-6, -6)
+        if inner.width > 0 and inner.height > 0:
+            pygame.draw.rect(screen, core, inner, border_radius=max(border_radius - 2, 1))
+
+        edge_color = accent.lerp(pygame.Color(255, 255, 255), 0.45)
+        edge_width = max(2, int(min(sqrect.width, sqrect.height) * 0.08))
+        if self.dir_x > 0:
+            pygame.draw.line(screen, edge_color, sqrect.topright, sqrect.bottomright, edge_width)
+        elif self.dir_x < 0:
+            pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.bottomleft, edge_width)
+        if self.dir_y > 0:
+            pygame.draw.line(screen, edge_color, sqrect.bottomleft, sqrect.bottomright, edge_width)
+        elif self.dir_y < 0:
+            pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.topright, edge_width)
+
+        center_x = sqrect.centerx + int(self.dir_x * sqrect.width * 0.08)
+        center_y = sqrect.centery + int(self.dir_y * sqrect.height * 0.08)
+        radius = max(3, int(min(sqrect.width, sqrect.height) * 0.14))
+        pygame.draw.polygon(screen, edge_color, [
+            (center_x, center_y - radius),
+            (center_x + radius, center_y),
+            (center_x, center_y + radius),
+            (center_x - radius, center_y),
+        ])
+
+        bounce_age = (pygame.time.get_ticks() - self.time_since_glow_start) / 1000
+        if 0 <= bounce_age < 0.15:
+            flash = 1.0 - bounce_age / 0.15
+            flash_color = accent.lerp(pygame.Color(255, 255, 255), flash)
+            width = max(2, int(5 * flash))
+            if self.latest_bounce_direction == 0:
+                x = sqrect.left if self.dir_x > 0 else sqrect.right
+                pygame.draw.line(screen, flash_color, (x, sqrect.top), (x, sqrect.bottom), width)
+            else:
+                y = sqrect.top if self.dir_y > 0 else sqrect.bottom
+                pygame.draw.line(screen, flash_color, (sqrect.left, y), (sqrect.right, y), width)
+
     def draw(self, screen: pygame.Surface, sqrect: pygame.Rect):
         if self.died:
             return
-        square_color_index = round((self.dir_x + 1) / 2 + self.dir_y + 1)
-        self.register_past_color(get_colors()["square"][square_color_index % len(get_colors()["square"])])
 
         if Config.theme == "dark_modern" and make_glowy2 is not None:
             self.draw_glowing3(screen, sqrect)
-        else:
-            pygame.draw.rect(screen, (0, 0, 0), sqrect)
-            sq_surf = self.get_surface(
-                tuple(sqrect.inflate(-int(Config.SQUARE_SIZE / 5), -int(Config.SQUARE_SIZE / 5))[2:]))
-            screen.blit(sq_surf, sq_surf.get_rect(center=sqrect.center))
+        self._draw_neon_core(screen, sqrect)
 
     @x.setter
     def x(self, val: int):

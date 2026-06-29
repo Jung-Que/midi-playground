@@ -141,7 +141,7 @@ class Config:
     SCREEN_HEIGHT = pygame.display.Info().current_h if pygame.display.Info().current_h else 1080
     theme: Optional[str] = "dark"
     seed: Optional[int] = None
-    camera_mode: Optional[int] = 2
+    camera_mode: Optional[int] = 4
     start_playing_delay = 3000
     max_notes: Optional[int] = None
     bounce_min_spacing: Optional[float] = 30
@@ -159,6 +159,29 @@ class Config:
 
     # rolling world
     map_retention_seconds = 5
+    map_fade_seconds = 0.35
+    peg_visible_min = 3
+    peg_visible_max = 6
+    peg_visible_past_max = 3
+    peg_density_window_seconds = 1.0
+    peg_preview_seconds = 0.5
+    peg_past_fade_seconds = 1.5
+    peg_overlap_padding = 8
+    peg_guide_line = True
+    peg_order_count = 3
+    peg_countdown_seconds = 0.6
+    peg_impact_seconds = 0.18
+    peg_impact_ring_seconds = 0.3
+    camera_target_lead = 0.3
+    camera_max_lead_ratio = 0.22
+    camera_smoothing_seconds = 0.2
+    camera_max_speed = 2400
+    square_afterimage_count = 4
+    square_afterimage_seconds = 0.28
+    square_afterimage_rate = 20
+    particle_max_active = 200
+    particle_bounce_lifetime = 0.25
+    particle_death_lifetime = 0.7
     map_view_margin = 2.0
     map_chunk_seconds = 15
     map_preload_seconds = 30
@@ -174,7 +197,7 @@ class Config:
     backtrack_amount: Optional[int] = 40
     rainbow_speed: Optional[int] = 30
     square_swipe_anim_speed: Optional[int] = 4
-    particle_amount = 10
+    particle_amount = 8
     language = "english"
 
     # other random stuff
@@ -193,14 +216,16 @@ class Config:
                   "square_speed", "volume", "music_offset", "direction_change_chance", "hp_drain_rate", "theatre_mode",
                   "particle_trail", "shader_file_name", "do_color_bounce_pegs", 
                   "do_particles_on_bounce", "bounce_effect", "square_glow", "glow_intensity",
-                  "particle_amount", "map_retention_seconds", "performance_hud", "language",
+                  "particle_amount", "map_retention_seconds", "map_fade_seconds",
+                  "peg_visible_max", "peg_past_fade_seconds", "peg_overlap_padding", "peg_guide_line",
+                  "performance_hud", "language",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
     # glow effect, for dark_modern only for now
     square_glow = True
-    square_glow_duration = 0.8
+    square_glow_duration = 0.25
     glow_intensity = 15  # 1-40
-    square_min_glow = 7
+    square_min_glow = 3
     border_color = pygame.Color(255, 255, 255)
     glow_color = pygame.Color(255, 255, 255)
 

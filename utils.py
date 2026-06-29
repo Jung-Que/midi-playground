@@ -57,6 +57,15 @@ class CameraFollow(Enum):
     Lazy = 1  # lazy camera, used by Crazy Nutter 101
     Smoothed = 2  # smoothed camera, interpolates camera a little bit between current and previous every frame
     Predictive = 3  # smoothed camera, but you can see where the square will bounce better
+    TargetLead = 4  # frame the square and its immediate target together
+
+
+def get_camera_follow(value, default=CameraFollow.TargetLead) -> CameraFollow:
+    """Load old or invalid saved camera values without crashing startup."""
+    try:
+        return CameraFollow(int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def read_osu_file(filedata: bytes):

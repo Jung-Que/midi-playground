@@ -10,6 +10,8 @@ from square import Square
 from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
+from math import ceil
+from time import monotonic
 import tracemalloc
 from audioclock import AudioClock
 from streaming import (
@@ -38,6 +40,8 @@ class RuntimeMapChunk:
     bounce_data: list[tuple[list[float], list[int], float, int]] = field(default_factory=list)
     start_position: list[float] = field(default_factory=list)
     materialized: bool = True
+    geometry_cursor: int = 0
+    safe_area_cursor: int = 0
 
 
 class Game:
@@ -48,9 +52,12 @@ class Game:
         self.world = World()
         self.safe_areas: list[pygame.Rect] = []
         self.safe_area_times: list[float] = []
+        self.geometry_visible_since: list[float] = []
+        self.safe_area_visible_since: list[float] = []
         self.camera_ctrl_text = get_font(24).render("Manual Camera Control Activated", True, (0, 255, 0))
         self.music_has_played = False
         self.offset_happened = False
+        self.bounce_schedule_offset = 0.0
         self.loading_text = get_font(24).render("Loading...", True, (255, 255, 255))
         self.keystrokes = Keystrokes()
         self.misses = 0
@@ -74,6 +81,12 @@ class Game:
         self.active_map_stream = None
         self.consecutive_skips = 0
         self.fps_smoothed = 0.0
+        self.visible_peg_count = 0
+        self.peg_order_font = get_font(16)
+        self.square_afterimages = deque(maxlen=max(int(Config.square_afterimage_count), 1))
+        self.afterimage_elapsed = 0.0
+        self._afterimage_layer = None
+        self._particle_layer = None
         self.audio_clock = AudioClock(pygame.mixer.music.get_pos)
 
     def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
@@ -109,11 +122,16 @@ class Game:
         self.notes = []
         self.safe_areas = []
         self.safe_area_times = []
+        self.geometry_visible_since = []
+        self.safe_area_visible_since = []
+        self.square_afterimages = deque(maxlen=max(int(Config.square_afterimage_count), 1))
+        self.afterimage_elapsed = 0.0
         self.map_chunks = deque()
         self._active_chunk_signature = None
         self.active_map_stream = prepared.stream_slot if prepared is not None else None
         self.music_has_played = audio_already_playing
         self.offset_happened = seamless
+        self.bounce_schedule_offset = 0.0
         self.play_delay_ms = 0 if seamless else Config.start_playing_delay
         self.misses = 0
         self.mouse_down = False
@@ -122,7 +140,8 @@ class Game:
 
         if not seamless:
             self.camera = Camera()
-        self.camera.lock_type = CameraFollow(Config.camera_mode)
+        self.camera.lock_type = get_camera_follow(Config.camera_mode)
+        Config.camera_mode = self.camera.lock_type.value
         self.camera.locked_on_square = True
 
         if prepared is None:
@@ -172,6 +191,15 @@ class Game:
         self.map_chunks = self._build_runtime_chunks(prepared)
         self._active_chunk_signature = None
         self._refresh_map_window(0.0, force=True)
+
+    def _shift_pending_bounce_schedule(self, seconds: float):
+        """Apply one shared world-time offset to current and future stream chunks."""
+        seconds = float(seconds)
+        if not seconds:
+            return
+        self.bounce_schedule_offset += seconds
+        for bounce in self.world.future_bounces:
+            bounce.time += seconds
 
     @staticmethod
     def _square_rect(position: list[float]) -> pygame.Rect:
@@ -234,26 +262,59 @@ class Game:
     def _refresh_map_window(self, map_time: float, force: bool = False):
         cutoff = map_time - float(Config.map_retention_seconds)
         horizon = map_time + float(Config.map_preload_seconds)
-        while self.map_chunks and self.map_chunks[0].end_time < cutoff:
+
+        # Chunks are generation/transport units only. Reveal their contents one
+        # bounce at a time so a 15-second chunk never pops into the scene at once.
+        for chunk in self.map_chunks:
+            if chunk.start_time > horizon:
+                break
+            self._materialize_chunk(chunk)
+            while (
+                    chunk.geometry_cursor < len(chunk.rectangles) and
+                    chunk.collision_times[chunk.geometry_cursor] <= horizon
+            ):
+                source_index = chunk.geometry_cursor
+                target_index = len(self.world.rectangles)
+                rect = chunk.rectangles[source_index]
+                self.world.rectangles.append(rect)
+                self.world.collision_times.append(chunk.collision_times[source_index])
+                self.world.colors.append(chunk.colors[source_index])
+                self.geometry_visible_since.append(monotonic())
+                self.world.geometry_index.insert(target_index, rect)
+                chunk.geometry_cursor += 1
+
+            while (
+                    chunk.safe_area_cursor < len(chunk.safe_areas) and
+                    chunk.safe_area_times[chunk.safe_area_cursor] <= horizon
+            ):
+                source_index = chunk.safe_area_cursor
+                target_index = len(self.safe_areas)
+                rect = chunk.safe_areas[source_index]
+                self.safe_areas.append(rect)
+                self.safe_area_times.append(chunk.safe_area_times[source_index])
+                self.safe_area_visible_since.append(monotonic())
+                self.world.safe_area_index.insert(target_index, rect)
+                chunk.safe_area_cursor += 1
+
+        # Once a chunk has handed off all of its records, its metadata can go.
+        # Render records have their own per-item retention lifecycle below.
+        while self.map_chunks:
+            first = self.map_chunks[0]
+            fully_revealed = (
+                first.geometry_cursor >= len(first.rectangles) and
+                first.safe_area_cursor >= len(first.safe_areas)
+            )
+            if not fully_revealed or first.end_time >= cutoff:
+                break
             self.map_chunks.popleft()
 
-        active = [
-            chunk for chunk in self.map_chunks
-            if chunk.end_time >= cutoff and chunk.start_time <= horizon
-        ]
-        for chunk in active:
-            self._materialize_chunk(chunk)
-        signature = tuple((chunk.start_time, chunk.end_time, len(chunk.rectangles)) for chunk in active)
-        if not force and signature == self._active_chunk_signature:
-            return
-        self._active_chunk_signature = signature
-        self.active_map_chunk_count = len(active)
-        self.world.rectangles = [rect for chunk in active for rect in chunk.rectangles]
-        self.world.collision_times = [timestamp for chunk in active for timestamp in chunk.collision_times]
-        self.world.colors = [color for chunk in active for color in chunk.colors]
-        self.safe_areas = [rect for chunk in active for rect in chunk.safe_areas]
-        self.safe_area_times = [timestamp for chunk in active for timestamp in chunk.safe_area_times]
-        self.world.rebuild_spatial_indexes(self.safe_areas)
+        self.active_map_chunk_count = sum(
+            chunk.end_time >= cutoff and chunk.start_time <= horizon
+            for chunk in self.map_chunks
+        )
+        self._active_chunk_signature = (
+            len(self.map_chunks), len(self.world.rectangles), len(self.safe_areas)
+        )
 
     def _ingest_stream_chunks(self, map_time: float):
         if self.active_map_stream is None:
@@ -275,10 +336,24 @@ class Game:
         if chunks:
             for chunk in chunks:
                 new_bounces = [
-                    Bounce(position, direction, timestamp, axis)
+                    Bounce(
+                        position,
+                        direction,
+                        timestamp + self.bounce_schedule_offset,
+                        axis,
+                    )
                     for position, direction, timestamp, axis in chunk.bounces
                 ]
-                self.world.future_bounces.extend(new_bounces)
+                if (
+                        new_bounces and self.world.future_bounces and
+                        new_bounces[0].time < self.world.future_bounces[-1].time
+                ):
+                    self.world.future_bounces = deque(sorted(
+                        (*self.world.future_bounces, *new_bounces),
+                        key=lambda bounce: bounce.time,
+                    ))
+                else:
+                    self.world.future_bounces.extend(new_bounces)
                 self.world.total_bounces += len(new_bounces)
                 chunk_map = PreparedMap(
                     bounces=list(chunk.bounces),
@@ -310,6 +385,7 @@ class Game:
             )
             self.safe_areas.append(previous.union(target))
             self.safe_area_times.append(bounce.time - time_offset)
+            self.safe_area_visible_since.append(0.0)
             previous = target
 
     def _load_music(self, audio_data: bytes, extension: str):
@@ -366,15 +442,15 @@ class Game:
             return
 
         bounces = [Bounce(pos, direction, timestamp, axis) for pos, direction, timestamp, axis in prepared.bounces]
-        schedule_offset = self.play_delay_ms / 1000
+        schedule_offset = self.bounce_schedule_offset
         for bounce in bounces:
             bounce.time += schedule_offset
-        if schedule_offset:
-            self.offset_happened = True
+        self._ensure_map_metadata_alignment()
         past_geometry = [
-            (rect, timestamp, color)
-            for rect, timestamp, color in zip(
-                self.world.rectangles, self.world.collision_times, self.world.colors
+            (rect, timestamp, color, visible_since)
+            for rect, timestamp, color, visible_since in zip(
+                self.world.rectangles, self.world.collision_times, self.world.colors,
+                self.geometry_visible_since,
             )
             if timestamp <= map_time
         ]
@@ -385,24 +461,21 @@ class Game:
         self.world.total_bounces = self.world.completed_bounces + len(bounces)
 
         past_safe_areas = [
-            (rect, timestamp)
-            for rect, timestamp in zip(self.safe_areas, self.safe_area_times)
+            (rect, timestamp, visible_since)
+            for rect, timestamp, visible_since in zip(
+                self.safe_areas, self.safe_area_times, self.safe_area_visible_since
+            )
             if timestamp <= map_time
         ]
-        rebuilt_chunks = self._build_runtime_chunks(prepared)
-        self.map_chunks = deque()
-        if past_geometry or past_safe_areas:
-            retained_times = [item[1] for item in past_geometry] + [item[1] for item in past_safe_areas]
-            self.map_chunks.append(RuntimeMapChunk(
-                start_time=min(retained_times, default=map_time),
-                end_time=map_time,
-                rectangles=[item[0] for item in past_geometry],
-                collision_times=[item[1] for item in past_geometry],
-                colors=[item[2] for item in past_geometry],
-                safe_areas=[item[0] for item in past_safe_areas],
-                safe_area_times=[item[1] for item in past_safe_areas],
-            ))
-        self.map_chunks.extend(rebuilt_chunks)
+        self.world.rectangles = [item[0] for item in past_geometry]
+        self.world.collision_times = [item[1] for item in past_geometry]
+        self.world.colors = [item[2] for item in past_geometry]
+        self.geometry_visible_since = [item[3] for item in past_geometry]
+        self.safe_areas = [item[0] for item in past_safe_areas]
+        self.safe_area_times = [item[1] for item in past_safe_areas]
+        self.safe_area_visible_since = [item[2] for item in past_safe_areas]
+        self.world.rebuild_spatial_indexes(self.safe_areas)
+        self.map_chunks = self._build_runtime_chunks(prepared)
         self._active_chunk_signature = None
         self._refresh_map_window(map_time, force=True)
 
@@ -537,11 +610,8 @@ class Game:
     def _prune_rolling_world(self, screen_rect: pygame.Rect):
         retention = float(Config.map_retention_seconds)
         map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
-        if self.map_chunks:
-            self._refresh_map_window(map_time)
-            self.world.prune_past_bounces(retention)
-            return
-
+        self._refresh_map_window(map_time)
+        self._ensure_map_metadata_alignment()
         cutoff = map_time - retention
         margin = max(float(Config.map_view_margin), 0.0)
         expanded_view = screen_rect.inflate(
@@ -549,26 +619,189 @@ class Game:
             int(screen_rect.height * margin),
         )
 
+        geometry_count = len(self.world.rectangles)
         kept_geometry = []
-        for rect, collision_time, color in zip(
-                self.world.rectangles, self.world.collision_times, self.world.colors
+        for rect, collision_time, color, visible_since in zip(
+                self.world.rectangles, self.world.collision_times, self.world.colors,
+                self.geometry_visible_since,
         ):
             visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
             if collision_time >= cutoff or visible_nearby:
-                kept_geometry.append((rect, collision_time, color))
+                kept_geometry.append((rect, collision_time, color, visible_since))
         self.world.rectangles = [item[0] for item in kept_geometry]
         self.world.collision_times = [item[1] for item in kept_geometry]
         self.world.colors = [item[2] for item in kept_geometry]
+        self.geometry_visible_since = [item[3] for item in kept_geometry]
 
+        safe_area_count = len(self.safe_areas)
         kept_safe_areas = []
-        for rect, area_time in zip(self.safe_areas, self.safe_area_times):
+        for rect, area_time, visible_since in zip(
+                self.safe_areas, self.safe_area_times, self.safe_area_visible_since
+        ):
             visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
             if area_time >= cutoff or visible_nearby:
-                kept_safe_areas.append((rect, area_time))
+                kept_safe_areas.append((rect, area_time, visible_since))
         self.safe_areas = [item[0] for item in kept_safe_areas]
         self.safe_area_times = [item[1] for item in kept_safe_areas]
-        self.world.rebuild_spatial_indexes(self.safe_areas)
+        self.safe_area_visible_since = [item[2] for item in kept_safe_areas]
+        if geometry_count != len(kept_geometry) or safe_area_count != len(kept_safe_areas):
+            self.world.rebuild_spatial_indexes(self.safe_areas)
         self.world.prune_past_bounces(retention)
+
+    def _ensure_map_metadata_alignment(self):
+        """Keep reveal metadata compatible with legacy/tests that inject geometry."""
+        geometry_missing = len(self.world.rectangles) - len(self.geometry_visible_since)
+        if geometry_missing > 0:
+            self.geometry_visible_since.extend([0.0] * geometry_missing)
+        elif geometry_missing < 0:
+            del self.geometry_visible_since[len(self.world.rectangles):]
+
+        safe_area_missing = len(self.safe_areas) - len(self.safe_area_visible_since)
+        if safe_area_missing > 0:
+            self.safe_area_visible_since.extend([0.0] * safe_area_missing)
+        elif safe_area_missing < 0:
+            del self.safe_area_visible_since[len(self.safe_areas):]
+
+    @staticmethod
+    def _reveal_color(start, target, visible_since: float, reveal_time: float):
+        duration = max(float(Config.map_fade_seconds), 0.0)
+        if duration == 0:
+            return target
+        progress = max(0.0, min(1.0, (reveal_time - visible_since) / duration))
+        return pygame.Color(start).lerp(pygame.Color(target), progress)
+
+    def _visible_map_records(self, map_time: float):
+        """Choose a small, readable set without reducing the generated map."""
+        future = [
+            index for index, timestamp in enumerate(self.world.collision_times)
+            if timestamp >= map_time
+        ]
+        past = [
+            index for index, timestamp in enumerate(self.world.collision_times)
+            if map_time - float(Config.peg_past_fade_seconds) <= timestamp < map_time
+        ]
+
+        density_window = max(float(Config.peg_density_window_seconds), 0.1)
+        preview_seconds = max(float(Config.peg_preview_seconds), 0.1)
+        local_bounces = sum(
+            self.world.collision_times[index] < map_time + density_window
+            for index in future
+        )
+        local_rate = local_bounces / density_window
+        minimum = max(int(Config.peg_visible_min), 1)
+        maximum = max(int(Config.peg_visible_max), minimum)
+        future_limit = max(minimum, min(maximum, ceil(local_rate * preview_seconds)))
+
+        padding = max(int(Config.peg_overlap_padding), 0)
+
+        def select_non_overlapping(candidates, limit):
+            selected = []
+            occupied = []
+            # Look slightly farther than the visible limit so an overlapping
+            # distant marker does not prevent a clearer marker from replacing it.
+            for index in candidates[:max(limit * 2, limit)]:
+                bounds = self.world.rectangles[index].inflate(padding * 2, padding * 2)
+                if occupied and any(bounds.colliderect(other) for other in occupied):
+                    continue
+                selected.append(index)
+                occupied.append(bounds)
+                if len(selected) >= limit:
+                    break
+            return selected
+
+        selected_future = select_non_overlapping(future, future_limit)
+        selected_past = select_non_overlapping(
+            list(reversed(past)), max(int(Config.peg_visible_past_max), 0)
+        )
+        geometry = set(selected_future + selected_past)
+        selected_times = {
+            self.world.collision_times[index] for index in geometry
+        }
+        safe_areas = {
+            index for index, timestamp in enumerate(self.safe_area_times)
+            if timestamp in selected_times
+        }
+        next_peg = future[0] if future else None
+        # The immediate target is never suppressed, even if configuration or
+        # overlap filtering would otherwise remove it.
+        if next_peg is not None:
+            geometry.add(next_peg)
+            selected_times.add(self.world.collision_times[next_peg])
+            safe_areas.update(
+                index for index, timestamp in enumerate(self.safe_area_times)
+                if timestamp == self.world.collision_times[next_peg]
+            )
+        return geometry, safe_areas, next_peg, future_limit
+
+    def _next_peg_world_position(self, map_time: float):
+        for index, timestamp in enumerate(self.world.collision_times):
+            if timestamp >= map_time:
+                return self.world.rectangles[index].center
+        return None
+
+    @staticmethod
+    def _ensure_effect_layer(layer, screen: pygame.Surface):
+        if layer is None or layer.get_size() != screen.get_size():
+            return pygame.Surface(screen.get_size(), pygame.SRCALPHA)
+        layer.fill((0, 0, 0, 0))
+        return layer
+
+    def _draw_square_afterimages(self, screen: pygame.Surface, now: float):
+        if not Config.particle_trail or self.world.square.died:
+            self.square_afterimages.clear()
+            self.afterimage_elapsed = 0.0
+            return
+
+        self.afterimage_elapsed += max(0.0, min(float(Config.dt), 0.1))
+        interval = 1.0 / max(float(Config.square_afterimage_rate), 1.0)
+        if self.afterimage_elapsed >= interval:
+            self.afterimage_elapsed %= interval
+            self.square_afterimages.append((
+                self.world.square.rect.copy(),
+                self.world.square.accent_color(),
+                now,
+            ))
+
+        lifetime = max(float(Config.square_afterimage_seconds), 0.001)
+        alive = deque(maxlen=max(int(Config.square_afterimage_count), 1))
+        self._afterimage_layer = self._ensure_effect_layer(self._afterimage_layer, screen)
+        for rect, color, created_at in self.square_afterimages:
+            progress = (now - created_at) / lifetime
+            if progress >= 1.0:
+                continue
+            alive.append((rect, color, created_at))
+            alpha = int(120 * (1.0 - max(progress, 0.0)) ** 2)
+            offsetted = self.camera.offset(rect)
+            pygame.draw.rect(
+                self._afterimage_layer,
+                (*pygame.Color(color)[:3], alpha),
+                offsetted,
+                width=max(2, rect.width // 12),
+                border_radius=max(2, rect.width // 7),
+            )
+        self.square_afterimages = alive
+        screen.blit(self._afterimage_layer, (0, 0))
+
+    def _draw_particles(self, screen: pygame.Surface, screen_rect: pygame.Rect):
+        particle_view = screen_rect.inflate(screen_rect.width, screen_rect.height)
+        alive_particles = []
+        self._particle_layer = self._ensure_effect_layer(self._particle_layer, screen)
+        for particle in self.world.particles:
+            expired = particle.age()
+            offsetted = self.camera.offset(particle.rect)
+            if expired or not particle_view.colliderect(offsetted):
+                continue
+            alive_particles.append(particle)
+            if screen_rect.colliderect(offsetted):
+                color = (*particle.color[:3], particle.alpha)
+                pygame.draw.rect(
+                    self._particle_layer,
+                    color,
+                    offsetted,
+                    border_radius=max(1, offsetted.width // 3),
+                )
+        self.world.particles = alive_particles[-max(int(Config.particle_max_active), 1):]
+        screen.blit(self._particle_layer, (0, 0))
 
     def draw(self, screen: pygame.Surface, n_frames: int):
 
@@ -579,16 +812,14 @@ class Game:
 
         if not self.music_has_played:
             if not self.offset_happened:
-                for bnc_change in self.world.future_bounces:
-                    bnc_change.time += self.play_delay_ms / 1000
+                self._shift_pending_bounce_schedule(self.play_delay_ms / 1000)
             self.offset_happened = True
             if self.world.time-Config.current_song.music_offset/1000 > self.play_delay_ms/1000:
                 self.music_has_played = True
                 song_load_before = get_current_time()
                 pygame.mixer.music.play()
                 self.audio_clock.start_now(get_current_time())
-                for bnc_change in self.world.future_bounces:
-                    bnc_change.time += get_current_time()-song_load_before
+                self._shift_pending_bounce_schedule(get_current_time() - song_load_before)
 
         screen_rect = screen.get_rect()
 
@@ -611,7 +842,10 @@ class Game:
 
         # square in center of camera if locked
         if self.camera.locked_on_square:
-            self.camera.follow(self.world.square)
+            self.camera.follow(
+                self.world.square,
+                self._next_peg_world_position(map_time),
+            )
 
         self._prune_rolling_world(screen_rect)
         world_view = screen_rect.move(int(self.camera.x), int(self.camera.y))
@@ -628,46 +862,119 @@ class Game:
 
         # safe areas
         total_rects = 0
+        colors = get_colors()
+        reveal_time = monotonic()
+        visible_geometry, visible_safe_areas, next_peg, _ = self._visible_map_records(map_time)
+        self.visible_peg_count = len(visible_geometry)
+        future_peg_order = sorted(
+            (
+                index for index in visible_geometry
+                if self.world.collision_times[index] >= map_time
+            ),
+            key=lambda index: self.world.collision_times[index],
+        )
+        peg_ranks = {
+            index: rank
+            for rank, index in enumerate(
+                future_peg_order[:max(int(Config.peg_order_count), 0)],
+                start=1,
+            )
+        }
         for safe_index in self.world.visible_safe_areas(world_view):
+            if safe_index not in visible_safe_areas:
+                continue
             safe_area = self.safe_areas[safe_index]
             offsetted = self.camera.offset(safe_area)
             if screen_rect.colliderect(offsetted):
                 total_rects += 1
-                pygame.draw.rect(screen, get_colors()["hallway"], offsetted)
+                color = self._reveal_color(
+                    colors["background"], colors["hallway"],
+                    self.safe_area_visible_since[safe_index], reveal_time,
+                )
+                if self.safe_area_times[safe_index] < map_time:
+                    fade = min(
+                        1.0,
+                        (map_time - self.safe_area_times[safe_index]) /
+                        max(float(Config.peg_past_fade_seconds), 0.001),
+                    )
+                    color = pygame.Color(color).lerp(colors["background"], fade)
+                pygame.draw.rect(screen, color, offsetted)
+
+        if Config.peg_guide_line and next_peg is not None:
+            target = self.camera.offset(self.world.rectangles[next_peg]).center
+            guide_color = pygame.Color(colors["hallway"]).lerp(colors["square"][0], 0.65)
+            pygame.draw.line(screen, guide_color, sqrect.center, target, width=2)
 
         # draw pegs
         for i in self.world.visible_geometry(world_view):
+            if i not in visible_geometry:
+                continue
             bounce_rect = self.world.rectangles[i]
             offsetted = self.camera.offset(bounce_rect)
 
             if offsetted.colliderect(screen_rect):
                 total_rects += 1
+                draw_rect = offsetted.copy()
                 if Config.do_color_bounce_pegs and self.world.collision_times[i] < (self.world.time * 1000 + Config.music_offset - self.play_delay_ms)/1000:
-                    pygame.draw.rect(screen, self.world.colors[i], offsetted)
+                    target_color = self.world.colors[i]
                 else:
-                    pygame.draw.rect(screen, get_colors()["background"], offsetted)
+                    target_color = colors["background"]
+                color = self._reveal_color(
+                    colors["hallway"], target_color,
+                    self.geometry_visible_since[i], reveal_time,
+                )
+                if self.world.collision_times[i] < map_time:
+                    impact_age = map_time - self.world.collision_times[i]
+                    fade = min(
+                        1.0,
+                        impact_age /
+                        max(float(Config.peg_past_fade_seconds), 0.001),
+                    )
+                    color = pygame.Color(color).lerp(colors["hallway"], fade)
+                    impact_duration = max(float(Config.peg_impact_seconds), 0.001)
+                    if impact_age < impact_duration:
+                        strength = 1.0 - impact_age / impact_duration
+                        amount = int(10 * strength)
+                        if draw_rect.height >= draw_rect.width:
+                            draw_rect.inflate_ip(amount, -amount // 2)
+                        else:
+                            draw_rect.inflate_ip(-amount // 2, amount)
+                        color = pygame.Color(color).lerp(colors["square"][0], strength * 0.75)
+                pygame.draw.rect(screen, color, draw_rect)
+                if i == next_peg:
+                    pygame.draw.rect(
+                        screen,
+                        colors["square"][0],
+                        offsetted.inflate(12, 12),
+                        width=3,
+                        border_radius=3,
+                    )
+                    time_to_hit = self.world.collision_times[i] - map_time
+                    countdown = max(float(Config.peg_countdown_seconds), 0.001)
+                    if 0.0 <= time_to_hit <= countdown:
+                        progress = time_to_hit / countdown
+                        radius = int(max(offsetted.width, offsetted.height) / 2 + 8 + 28 * progress)
+                        pygame.draw.circle(
+                            screen, colors["square"][0], offsetted.center, radius, width=2
+                        )
 
-        # particles
-        particle_view = screen_rect.inflate(screen_rect.width, screen_rect.height)
-        alive_particles = []
-        for particle in self.world.particles:
-            expired = particle.age()
-            offsetted = self.camera.offset(particle.rect)
-            if expired or not particle_view.colliderect(offsetted):
-                continue
-            alive_particles.append(particle)
-            if screen_rect.colliderect(offsetted):
-                pygame.draw.rect(screen, particle.color, offsetted)
-        self.world.particles = alive_particles
+                if i in peg_ranks:
+                    label = self.peg_order_font.render(
+                        str(peg_ranks[i]), True, colors["square"][0]
+                    )
+                    label_rect = label.get_rect(midbottom=(offsetted.centerx, offsetted.top - 7))
+                    screen.blit(label, label_rect)
 
-        # particle trail in game
-        if Config.particle_trail:
-            # every 2 frames add a particle
-            if not self.world.square.died:
-                if n_frames % 2 == 0:
-                    new = Particle(self.world.square.pos, [0, 0], True)
-                    new.delta = [random.randint(-10, 10)/20, random.randint(-10, 10)/20]
-                    self.world.particles.append(new)
+                impact_age = map_time - self.world.collision_times[i]
+                ring_duration = max(float(Config.peg_impact_ring_seconds), 0.001)
+                if 0.0 <= impact_age < ring_duration:
+                    progress = impact_age / ring_duration
+                    radius = int(max(offsetted.width, offsetted.height) / 2 + 8 + 32 * progress)
+                    ring_color = pygame.Color(colors["square"][0]).lerp(colors["hallway"], progress)
+                    pygame.draw.circle(screen, ring_color, offsetted.center, radius, width=2)
+
+        self._draw_square_afterimages(screen, reveal_time)
+        self._draw_particles(screen, screen_rect)
                 
         # scorekeeper drawing
         time_from_start = self.world.time-self.play_delay_ms/1000+Config.music_offset/1000
@@ -689,8 +996,16 @@ class Game:
                 pygame.mixer.music.stop()
                 play_sound("death.mp3", 0.5)
                 self.world.future_bounces = []
-                for _ in range(100):
-                    self.world.particles.append(Particle(self.world.square.pos, [random.randint(-3, 3), random.randint(-3, 3)]))
+                remaining = max(int(Config.particle_max_active) - len(self.world.particles), 0)
+                for _ in range(min(100, remaining)):
+                    self.world.particles.append(Particle(
+                        self.world.square.pos,
+                        [random.randint(-3, 3), random.randint(-3, 3)],
+                        color=self.world.square.accent_color(),
+                        lifetime=Config.particle_death_lifetime,
+                        size_range=(5, 12),
+                        speed_scale=0.8,
+                    ))
             if self.world.square.died:
                 self.world.scorekeeper.hp = 0
 
@@ -792,7 +1107,7 @@ class Game:
             wait_ms = (get_current_time() - self.transition_wait_started_at) * 1000
         lines = (
             f"FPS {self.fps_smoothed:5.1f} | Python memory {memory_bytes / 1024 / 1024:5.1f} MB",
-            f"Chunks {self.active_map_chunk_count}+{metrics['buffered_chunks']} buffered | Pegs {len(self.world.rectangles)} | Particles {len(self.world.particles)}",
+            f"Chunks {self.active_map_chunk_count}+{metrics['buffered_chunks']} buffered | Pegs {self.visible_peg_count}/{len(self.world.rectangles)} | Particles {len(self.world.particles)}",
             f"Prefetch {metrics['ready']}/{metrics['queued']} | Map {metrics['map_ms']:.0f} ms | Audio {metrics['audio_ms']:.0f} ms",
             f"Prepare {metrics['pending_ms']:.0f} ms | Wait {wait_ms:.0f} ms | Sync {self.transition_lag_ms:.0f} ms",
         )

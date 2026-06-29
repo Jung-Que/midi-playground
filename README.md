@@ -27,21 +27,39 @@ install requirements with `python3 -m pip install -r requirements.txt`
 
 start program with `python3 main.py`
 
+private or rights-unverified song packs can be placed in `songs-local/`. they appear first in the song selector with
+a `[LOCAL ONLY]` label, but `songs-local/`, `imports-local/`, and `exports/` are ignored by git and omitted from the
+verified package build. only redistribution-cleared packs belong in the tracked `songs/` directory.
+
 ## continuous playback and live settings
 
 choosing a song starts a continuous playlist from that song. while the current song is playing, maps and audio
 for the next two songs are prepared in the background. audio is queued only after its matching map is ready. a
 slow preparation waits safely at the transition, and a broken song is skipped without stopping the playlist.
 
-maps are generated incrementally in a worker process as time chunks. a bounded chunk buffer feeds only the
-retention/preload window into the live world; old chunks and offscreen particles are removed. a spatial hash limits
-collision and viewport queries. playback timing follows the mixer position when it is reliable and falls back to a
+maps are generated incrementally in a worker process as time chunks. chunks are transport units only: their pegs
+and safe areas enter the live world one bounce at a time and fade in briefly instead of appearing as a block. old
+records are removed individually after they leave the expanded viewport, while visible history is preserved. a
+spatial hash limits collision and viewport queries. playback timing follows the mixer position when it is reliable and falls back to a
 monotonic wall clock. the performance HUD shows FPS, python memory, active/buffered chunks, pegs, particles,
 preparation time, transition wait, and measured synchronization drift.
+initial and streamed bounces share one schedule offset so chunk boundaries cannot reorder pending collisions.
+
+map generation remains 30 seconds ahead, but rendering is density-aware: only the next three to six readable pegs
+are shown. overlapping later markers are suppressed without dropping their notes, the immediate target is outlined
+and connected by a guide line, and at most three recent pegs fade out over 1.5 seconds behind the square.
+the first three visible targets are numbered, the immediate target gets a music-timed countdown ring, and each hit
+briefly compresses its peg and emits an expanding confirmation ring. the TargetLead camera frames the square and
+next peg together with capped look-ahead and frame-rate-independent smoothing.
+
+the square uses a layered neon core with directional edge lighting and a short collision-face flash. movement trail
+particles are replaced by four time-based afterimages. bounce particles use delta-time-independent motion, directional
+theme colors, adaptive counts for dense songs, alpha fade, and a global active-particle budget. glow surfaces are
+quantized and cached instead of rebuilding the OpenCV bloom on every frame.
 
 press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
-left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, and map retention can
-be changed without stopping playback. square speed, bounce spacing, and direction chance regenerate only the
+left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, map retention, peg count,
+peg spacing, target guide, and fades can be changed without stopping playback. square speed, bounce spacing, and direction chance regenerate only the
 unplayed portion of the current map, starting from the square's current state.
 
 verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`
