@@ -6,14 +6,17 @@ from time import time as get_current_time
 from scorekeeper import Scorekeeper
 import random
 import pygame
+from collections import deque
 
 
 class World:
     """it's a cruel world out there"""
 
     def __init__(self):
-        self.future_bounces: list[Bounce] = []
+        self.future_bounces = deque()
         self.past_bounces: list[Bounce] = []
+        self.completed_bounces = 0
+        self.total_bounces = 0
         self.start_time = 0
         self.time = 0
         self.rectangles: list[pygame.Rect] = []
@@ -29,8 +32,13 @@ class World:
 
     def get_next_bounce(self) -> Bounce:
         """Also pops the bounce from the future_bounces list"""
-        self.past_bounces.append(self.future_bounces.pop(0))
+        self.past_bounces.append(self.future_bounces.popleft())
+        self.completed_bounces += 1
         return self.past_bounces[-1]
+
+    def prune_past_bounces(self, retention_seconds: float):
+        cutoff = self.time - retention_seconds
+        self.past_bounces = [bounce for bounce in self.past_bounces if bounce.time >= cutoff]
 
     def add_bounce_particles(self, sp: list[float], sd: list[float]):
         for _ in range(Config.particle_amount):
@@ -38,31 +46,34 @@ class World:
             self.particles.append(new)
 
     def handle_bouncing(self, square: Square):
-        if len(self.future_bounces):
-            if (self.time * 1000 + Config.music_offset)/1000 > self.future_bounces[0].time:
-                current_bounce = self.get_next_bounce()
-                before = square.dir.copy()
-                square.obey_bounce(current_bounce)
-                changed = square.dir.copy()
-                for _ in range(2):
-                    if before[_] == changed[_]:
-                        changed[_] = 0
-                    else:
-                        changed[_] = -changed[_]
-                if Config.do_particles_on_bounce:
-                    self.add_bounce_particles(square.pos, changed)
+        while self.future_bounces and (self.time * 1000 + Config.music_offset) / 1000 > self.future_bounces[0].time:
+            current_bounce = self.get_next_bounce()
+            before = square.dir.copy()
+            square.obey_bounce(current_bounce)
+            changed = square.dir.copy()
+            for axis in range(2):
+                if before[axis] == changed[axis]:
+                    changed[axis] = 0
+                else:
+                    changed[axis] = -changed[axis]
+            if Config.do_particles_on_bounce:
+                self.add_bounce_particles(square.pos, changed)
 
-                # stop square at end
-                if len(self.future_bounces) == 0:
-                    square.dir = [0, 0]
-                    square.pos = current_bounce.square_pos
+            # stop square at end
+            if not self.future_bounces:
+                square.dir = [0, 0]
+                square.pos = current_bounce.square_pos
 
     def handle_keypress(self, time_from_start, misses):
         return self.scorekeeper.do_keypress(time_from_start, misses)
 
     def gen_future_bounces(self, _start_notes: list[tuple[int, int, int]], percent_update_callback):
         """Recursive solution may be necessary"""
-        total_notes = len(_start_notes)
+        _start_notes = _start_notes[:Config.max_notes] if Config.max_notes is not None else _start_notes
+        filtered_notes = remove_too_close_values(list(_start_notes), Config.bounce_min_spacing)
+        total_notes = len(filtered_notes)
+        if total_notes == 0:
+            raise MapLoadingFailureError("The map does not contain any playable notes")
         max_percent = 0
         path = []
         safe_areas = []
@@ -153,25 +164,23 @@ class World:
                         path.pop()
                     return False
 
-        _start_notes = _start_notes[:Config.max_notes] if Config.max_notes is not None else _start_notes
+        self.scorekeeper.unhit_notes = filtered_notes.copy()
 
-        self.scorekeeper.unhit_notes = remove_too_close_values([_sn for _sn in _start_notes], Config.bounce_min_spacing)
-
-        self.future_bounces = recurs(
+        generated_bounces = recurs(
             square=self.square.copy(),
-            notes=remove_too_close_values(
-                [_sn for _sn in _start_notes],
-                threshold=Config.bounce_min_spacing
-            )
+            notes=filtered_notes
         )
 
-        if self.future_bounces is False:
+        if generated_bounces is False:
             raise MapLoadingFailureError("The map failed to generate because of the recursion function. " +
                                          "If the midi has too many notes too close, it may not generate. " +
                                          "Maybe try changing the \"square speed\" or \"change dir chance\" in the config")
 
-        if len(self.future_bounces) == 0:
+        if len(generated_bounces) == 0:
             raise MapLoadingFailureError("Map safearea list empty. Please report to the github under the issues tab")
+
+        self.future_bounces = deque(generated_bounces)
+        self.total_bounces = len(generated_bounces)
 
         percent_update_callback("Removing overlapping safe areas")
 

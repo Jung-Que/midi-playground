@@ -4,8 +4,8 @@ from utils import *
 
 class Bounce:
     def __init__(self, sq_pos: list[float], sq_dir: list[int], time: float, bounce_dir: int):
-        self.square_pos = sq_pos  # new square position
-        self.square_dir = sq_dir  # new square direction
+        self.square_pos = sq_pos.copy()  # new square position
+        self.square_dir = sq_dir.copy()  # new square direction
         self.bounce_dir = bounce_dir  # bounce direction for squish effect; i can't remember if 0 or 1 is horizontal
         self.time = time  # time during bounce
 
@@ -49,7 +49,7 @@ class Bounce:
                 )
 
     def copy(self) -> "Bounce":
-        return Bounce(self.square_pos, self.square_dir, self.time, self.bounce_dir)
+        return Bounce(self.square_pos.copy(), self.square_dir.copy(), self.time, self.bounce_dir)
 
     def __repr__(self):
         return f"<Bounce(sq_pos={self.square_pos}, sq_dir={self.square_dir}, time={self.time}, dir={self.bounce_dir})"

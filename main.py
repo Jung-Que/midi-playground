@@ -4,8 +4,11 @@ from game import Game
 from configpage import ConfigPage
 from songselector import SongSelector
 from errorscreen import ErrorScreen
-from os import getcwd
+from liveconfig import LiveConfigOverlay
+from os import chdir, getcwd
 from platform import system as get_os
+from pathlib import Path
+import sys
 from config import save_to_file
 import debuginfo
 import webbrowser
@@ -14,6 +17,9 @@ from array import array
 
 
 def main():
+    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    chdir(resource_root)
+
     # patch to fix mouse on high dpi displays
     if "Windows" in get_os():
         from ctypes import windll
@@ -96,6 +102,7 @@ def main():
     config_page = ConfigPage()
     error_screen = ErrorScreen()
     game = Game()
+    live_config = LiveConfigOverlay()
 
     # game loop
     running = True
@@ -115,6 +122,9 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+                continue
+            if live_config.handle_event(event, game):
+                continue
             if event.type == pygame.KEYDOWN:
                 # artificial lag spike for debugging purposes
                 if event.key == pygame.K_F12:
@@ -138,6 +148,7 @@ def main():
                             song_selector.selected_index = -1
                         continue
                     if game.active:
+                        game.stop_playlist()
                         game.active = False
                         song_selector.active = True
                         pygame.mixer.music.load("./assets/mainmenu.mp3")
@@ -188,7 +199,8 @@ def main():
                 # starting song now
                 Config.current_song = song
                 game.active = True
-                if msg := game.start_song(screen):
+                selected_index = song_selector.songs.index(song)
+                if msg := game.start_playlist(song_selector.songs, selected_index, screen):
                     if isinstance(msg, str):
                         game.active = False
                         error_screen.active = True
@@ -207,6 +219,7 @@ def main():
 
             # handle game events
             if game.handle_event(event):
+                game.stop_playlist()
                 game.active = False
                 song_selector.active = True
 
@@ -216,13 +229,17 @@ def main():
         config_page.draw(screen)
         menu.draw(screen, n_frames)
         error_screen.draw(screen)
+        live_config.draw(screen, game.active)
 
         update_screen(screen, glsl_program, render_object)
 
         Config.dt = clock.tick(FRAMERATE) / 1000
+    game.shutdown()
     pygame.quit()
     save_to_file()
 
 
 if __name__ == '__main__':
+    from multiprocessing import freeze_support
+    freeze_support()
     main()

@@ -212,7 +212,7 @@ class ConfigPage:
         self.s_do_particles_on_bounce = pgui.elements.UIDropDownMenu(
             ["Off", "On"],
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH * 5 / 10, Config.SCREEN_HEIGHT * 7 // 10, 300, 30)),
-            starting_option=["Off", "On"][int(Config.do_color_bounce_pegs)],
+            starting_option=["Off", "On"][int(Config.do_particles_on_bounce)],
             manager=self.ui_manager
         )
         self.s_do_particles_on_bounce_label = pgui.elements.UILabel(
@@ -300,7 +300,7 @@ class ConfigPage:
                 self.s_game_volume_label.set_text(f"Music volume ({Config.volume}%):")
 
                 Config.music_offset = 0
-                self.s_music_offset.set_current_value(-300)
+                self.s_music_offset.set_current_value(0)
                 self.s_music_offset_label.set_text(f"Music offset ({Config.music_offset}ms):")
 
                 Config.direction_change_chance = 30
@@ -324,10 +324,16 @@ class ConfigPage:
                 self.s_particle_trail.current_state.start()
 
                 Config.do_color_bounce_pegs = False
-                self.s_do_bounce_color_pegs.selected_option = "Off",
+                self.s_do_bounce_color_pegs.selected_option = "Off"
                 self.s_do_bounce_color_pegs.current_state.finish()
                 self.s_do_bounce_color_pegs.current_state.selected_option = "Off"
                 self.s_do_bounce_color_pegs.current_state.start()
+
+                Config.do_particles_on_bounce = True
+                self.s_do_particles_on_bounce.selected_option = "On"
+                self.s_do_particles_on_bounce.current_state.finish()
+                self.s_do_particles_on_bounce.current_state.selected_option = "On"
+                self.s_do_particles_on_bounce.current_state.start()
 
                 Config.SCREEN_WIDTH = Config.rSCREEN_WIDTH
                 Config.SCREEN_HEIGHT = Config.rSCREEN_HEIGHT

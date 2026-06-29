@@ -27,7 +27,18 @@ install requirements with `python3 -m pip install -r requirements.txt`
 
 start program with `python3 main.py`
 
-build command: `pyinstaller main.py --noconsole --onefile --clean --hidden-import glcontext`
+## continuous playback and live settings
+
+choosing a song starts a continuous playlist from that song. while the current song is playing, the next song's
+map is generated in a worker process and its audio is prepared for the mixer queue. old map geometry is removed
+after it is both behind the playback time and outside the expanded camera view.
+
+press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
+left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, and map retention can
+be changed without stopping playback. square speed, bounce spacing, and direction chance regenerate only the
+unplayed portion of the current map, starting from the square's current state.
+
+verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`
 
 ## credits
 

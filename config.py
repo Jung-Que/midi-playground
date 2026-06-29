@@ -155,6 +155,11 @@ class Config:
     shader_file_name = "none.glsl"
     do_color_bounce_pegs = False
     do_particles_on_bounce = True
+    bounce_effect = True
+
+    # rolling world
+    map_retention_seconds = 5
+    map_view_margin = 2.0
 
     # settings that are not configurable (yet)
     backtrack_chance: Optional[float] = 0.02
@@ -179,7 +184,8 @@ class Config:
     save_attrs = ["theme", "seed", "camera_mode", "start_playing_delay", "max_notes", "bounce_min_spacing",
                   "square_speed", "volume", "music_offset", "direction_change_chance", "hp_drain_rate", "theatre_mode",
                   "particle_trail", "shader_file_name", "do_color_bounce_pegs", 
-                  "do_particles_on_bounce", "language",
+                  "do_particles_on_bounce", "bounce_effect", "square_glow", "glow_intensity",
+                  "particle_amount", "map_retention_seconds", "language",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
     # glow effect, for dark_modern only for now
@@ -192,7 +198,7 @@ class Config:
 
 
 def get_colors():
-    return Config.color_themes.get(Config.theme, "dark")
+    return Config.color_themes.get(Config.theme, Config.color_themes["dark"])
 
 
 def save_to_file(dat: Optional[dict[str, Any]] = None):
