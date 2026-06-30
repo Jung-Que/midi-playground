@@ -7,6 +7,7 @@ import pygame
 from pygame import Color
 from bounce import Bounce
 from math import cos, pi, sin
+from pathlib import Path
 
 
 class Square:
@@ -20,6 +21,7 @@ class Square:
 
         self.time_since_glow_start = 0
         self.glowy_surfaces = {}
+        self.custom_core_images = {}
 
     def register_past_color(self, col: tuple[int, int, int]):
         for _ in range(max(Config.square_swipe_anim_speed, 1)):
@@ -217,7 +219,23 @@ class Square:
         symbol = pygame.Surface((side, side), pygame.SRCALPHA)
         local_center = (side // 2, side // 2)
 
-        if shape == "circle":
+        if shape == "custom":
+            custom = self._load_custom_core_image(Config.square_core_image_path)
+            if custom is not None:
+                maximum = max(2, radius * 2)
+                ratio = min(maximum / custom.get_width(), maximum / custom.get_height())
+                size = (
+                    max(1, round(custom.get_width() * ratio)),
+                    max(1, round(custom.get_height() * ratio)),
+                )
+                scaled = pygame.transform.smoothscale(custom, size)
+                symbol.blit(scaled, scaled.get_rect(center=local_center))
+            else:
+                points = self._shape_points("diamond", local_center, radius)
+                pygame.draw.polygon(symbol, fill, points)
+                if outline_width:
+                    pygame.draw.polygon(symbol, outline, points, outline_width)
+        elif shape == "circle":
             pygame.draw.circle(symbol, fill, local_center, radius)
             if outline_width:
                 pygame.draw.circle(symbol, outline, local_center, radius, outline_width)
@@ -235,6 +253,31 @@ class Square:
         if rotation:
             symbol = pygame.transform.rotozoom(symbol, -rotation, 1.0)
         screen.blit(symbol, symbol.get_rect(center=center))
+
+    def _load_custom_core_image(self, path_value):
+        if not path_value:
+            return None
+        path = Path(str(path_value)).expanduser()
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        if stat.st_size <= 0 or stat.st_size > 20 * 1024 * 1024:
+            return None
+        key = str(path.resolve())
+        cached = self.custom_core_images.get(key)
+        if cached and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+            return cached[2]
+        try:
+            image = pygame.image.load(path).convert_alpha()
+        except (OSError, pygame.error):
+            return None
+        if image.get_width() > 4096 or image.get_height() > 4096:
+            return None
+        if len(self.custom_core_images) >= 8:
+            self.custom_core_images.clear()
+        self.custom_core_images[key] = (stat.st_mtime_ns, stat.st_size, image)
+        return image
 
     def _draw_neon_core(self, screen: pygame.Surface, sqrect: pygame.Rect):
         accent = self.accent_color()

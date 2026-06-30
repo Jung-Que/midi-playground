@@ -36,6 +36,11 @@ MP3/WAV/OGG file and one MIDI map, enter title/artist/mapper/source, preview the
 offset, and validate note density before creation. SHA-256 content fingerprints prevent duplicate local or public
 packs, and successful imports appear immediately in the song selector.
 
+`Customize Square` opens a dedicated live editor for the fixed outer square's inner symbol. it includes built-in
+shape presets, colour pickers, size/outline/rotation/bounce-pulse controls, transparent custom PNG installation,
+local preset saving, and JSON import/export. custom images and presets are copied under `presets-local/`, which is
+ignored by git. invalid or missing image files fall back to the diamond symbol without changing the hitbox.
+
 invalid or outdated values in `assets/settings.json` are clamped or restored during startup. source runs write
 rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
 `%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.

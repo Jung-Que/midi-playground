@@ -14,6 +14,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import pygame
+import pygame_gui as pgui
 
 import game as game_module
 from audioclock import AudioClock
@@ -37,6 +38,18 @@ from songimporter import (
 from songimportpage import SongImportPage
 from spatial import SpatialHash
 from square import Square
+from squarecustomizer import (
+    DEFAULT_STYLE,
+    SquareStyleError,
+    apply_style,
+    export_style_json,
+    import_style_json,
+    install_custom_png,
+    load_preset,
+    save_user_preset,
+    snapshot_style,
+)
+from squarecustomizerpage import SquareCustomizerPage
 from streaming import (
     MapChunk,
     PlaylistController,
@@ -1386,6 +1399,111 @@ class StreamingTests(unittest.TestCase):
         finally:
             for name, value in previous.items():
                 setattr(Config, name, value)
+
+    def test_square_style_presets_round_trip_with_unicode_names(self):
+        previous = snapshot_style()
+        try:
+            with TemporaryDirectory() as directory:
+                root = Path(directory)
+                Config.square_core_shape = "heart"
+                Config.square_core_color = "#FF4F91"
+                Config.square_core_scale = 0.61
+                preset = save_user_preset("하트 프리셋", root)
+                self.assertEqual(preset.name, "하트-프리셋.json")
+
+                apply_style(DEFAULT_STYLE)
+                load_preset(preset.stem, root)
+                self.assertEqual(Config.square_core_shape, "heart")
+                self.assertEqual(Config.square_core_color, "#FF4F91")
+                self.assertEqual(Config.square_core_scale, 0.61)
+
+                exported = export_style_json(root / "shared-style")
+                apply_style(DEFAULT_STYLE)
+                import_style_json(exported)
+                self.assertEqual(Config.square_core_shape, "heart")
+
+                broken = root / "broken.json"
+                broken.write_text("[not valid", encoding="utf-8")
+                with self.assertRaises(SquareStyleError):
+                    import_style_json(broken)
+        finally:
+            apply_style(previous)
+
+    def test_custom_png_is_installed_rendered_and_keeps_square_hitbox(self):
+        previous = snapshot_style()
+        square = Square(100, 100, 1, 1)
+        hitbox = square.rect.copy()
+        try:
+            with TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "heart.png"
+                image = pygame.Surface((64, 64), pygame.SRCALPHA)
+                pygame.draw.circle(image, (255, 0, 0, 255), (32, 32), 25)
+                pygame.image.save(image, source)
+                installed = install_custom_png(source, root / "assets")
+
+                Config.square_core_shape = "custom"
+                Config.square_core_image_path = str(installed)
+                Config.square_core_rotation_speed = 0
+                Config.square_core_pulse_strength = 0
+                canvas = pygame.Surface((200, 200), pygame.SRCALPHA)
+                square.draw(canvas, pygame.Rect(75, 75, 50, 50))
+                red_pixels = pygame.mask.from_threshold(
+                    canvas, pygame.Color(255, 0, 0), pygame.Color(12, 12, 12, 255)
+                ).count()
+                self.assertGreater(red_pixels, 0)
+                self.assertEqual(square.rect, hitbox)
+                self.assertIn("square_core_image_path", Config.save_attrs)
+        finally:
+            apply_style(previous)
+
+    def test_missing_or_corrupt_custom_png_falls_back_without_crashing(self):
+        previous = snapshot_style()
+        try:
+            Config.square_core_shape = "custom"
+            Config.square_core_image_path = "does-not-exist.png"
+            Config.square_core_color = "#FF00FF"
+            canvas = pygame.Surface((120, 120), pygame.SRCALPHA)
+            Square().draw(canvas, pygame.Rect(35, 35, 50, 50))
+            magenta = pygame.mask.from_threshold(
+                canvas, pygame.Color("#FF00FF"), pygame.Color(1, 1, 1, 255)
+            ).count()
+            self.assertGreater(magenta, 0)
+
+            with TemporaryDirectory() as directory:
+                corrupt = Path(directory) / "bad.png"
+                corrupt.write_bytes(b"not a png")
+                with self.assertRaises(SquareStyleError):
+                    install_custom_png(corrupt, Path(directory) / "assets")
+        finally:
+            apply_style(previous)
+
+    def test_customizer_page_applies_shape_and_slider_changes_live(self):
+        previous_style = snapshot_style()
+        previous_width = Config.SCREEN_WIDTH
+        previous_height = Config.SCREEN_HEIGHT
+        Config.SCREEN_WIDTH = 800
+        Config.SCREEN_HEIGHT = 600
+        page = SquareCustomizerPage()
+        page.active = True
+        try:
+            page.handle_event(pygame.event.Event(
+                pgui.UI_DROP_DOWN_MENU_CHANGED,
+                ui_element=page.shape_dropdown,
+                text="star",
+            ))
+            page.handle_event(pygame.event.Event(
+                pgui.UI_HORIZONTAL_SLIDER_MOVED,
+                ui_element=page.scale_slider,
+                value=0.7,
+            ))
+            self.assertEqual(Config.square_core_shape, "star")
+            self.assertEqual(Config.square_core_scale, 0.7)
+            page.draw(pygame.display.get_surface())
+        finally:
+            apply_style(previous_style)
+            Config.SCREEN_WIDTH = previous_width
+            Config.SCREEN_HEIGHT = previous_height
 
     def test_live_overlay_changes_and_persists_core_customization(self):
         names = (

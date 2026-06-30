@@ -12,8 +12,8 @@ def draw_beveled_rectangle(surf: pygame.Surface, color: pygame.Color, rect: pyga
 
 
 class MenuOption:
-    HEIGHT = (Config.SCREEN_HEIGHT//9)-2
     SPACING = 16
+    HEIGHT = max(56, min((Config.SCREEN_HEIGHT - 300) // 7 - SPACING, (Config.SCREEN_HEIGHT // 9) - 2))
 
     def __init__(self, id_: str, color: pygame.Color):
         self.id = id_
@@ -57,6 +57,7 @@ class Menu:
         self.menu_options: list[MenuOption] = [
             MenuOption("play", pygame.Color(214, 247, 163)),
             MenuOption("import-song", pygame.Color(205, 238, 174)),
+            MenuOption("customize-square", pygame.Color(199, 246, 180)),
             MenuOption("config", pygame.Color(196, 255, 178)),
             MenuOption("contribute", pygame.Color(183, 227, 204)),
             MenuOption("open-songs-folder", pygame.Color(125, 130, 184)),

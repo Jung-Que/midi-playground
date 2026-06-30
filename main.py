@@ -8,6 +8,7 @@ from game import Game
 from configpage import ConfigPage
 from songselector import SongSelector, make_song_from_zip
 from songimportpage import SongImportPage
+from squarecustomizerpage import SquareCustomizerPage
 from errorscreen import ErrorScreen
 from liveconfig import LiveConfigOverlay
 from os import chdir, getcwd
@@ -146,6 +147,59 @@ def run_import_smoke_test() -> int:
         raise RuntimeError("Duplicate local song was not rejected")
 
 
+def run_customizer_smoke_test() -> int:
+    """Exercise PNG installation, preset JSON, preview rendering, and hitbox isolation."""
+    set_resource_root()
+    from tempfile import TemporaryDirectory
+    from squarecustomizer import (
+        apply_style,
+        export_style_json,
+        import_style_json,
+        install_custom_png,
+        save_user_preset,
+        snapshot_style,
+    )
+    from square import Square
+
+    pygame.init()
+    screen = pygame.display.set_mode((800, 600))
+    previous_size = (Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT)
+    previous_style = snapshot_style()
+    Config.SCREEN_WIDTH = 800
+    Config.SCREEN_HEIGHT = 600
+    try:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "core.png"
+            image = pygame.Surface((64, 64), pygame.SRCALPHA)
+            pygame.draw.circle(image, (255, 60, 120, 255), (32, 32), 26)
+            pygame.image.save(image, source)
+            installed = install_custom_png(source, root / "assets")
+            Config.square_core_shape = "custom"
+            Config.square_core_image_path = str(installed)
+            Config.square_core_rotation_speed = 0
+            Config.square_core_pulse_strength = 0
+            square = Square(100, 100)
+            hitbox = square.rect.copy()
+            square.draw(screen, pygame.Rect(75, 75, 50, 50))
+            if square.rect != hitbox:
+                raise RuntimeError("Customizer changed the square hitbox")
+            preset = save_user_preset("Smoke Preset", root / "presets")
+            exported = export_style_json(root / "export.json")
+            apply_style(previous_style)
+            import_style_json(exported)
+            if Config.square_core_shape != "custom" or not preset.is_file():
+                raise RuntimeError("Customizer preset did not round-trip")
+            page = SquareCustomizerPage()
+            page.active = True
+            page.draw(screen)
+        return 0
+    finally:
+        apply_style(previous_style)
+        Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT = previous_size
+        pygame.quit()
+
+
 def main():
     set_resource_root()
 
@@ -233,6 +287,7 @@ def main():
     game = Game()
     live_config = LiveConfigOverlay()
     song_import_page = SongImportPage()
+    square_customizer_page = SquareCustomizerPage()
 
     # game loop
     running = True
@@ -295,6 +350,11 @@ def main():
                         song_import_page.stop_preview(resume_menu=True)
                         menu.active = True
                         continue
+                    if square_customizer_page.active:
+                        square_customizer_page.active = False
+                        save_to_file()
+                        menu.active = True
+                        continue
                     if error_screen.active:
                         error_screen.active = False
                         song_selector.active = True
@@ -315,6 +375,8 @@ def main():
                     config_page.active = True
                 if option_id == "import-song":
                     song_import_page.active = True
+                if option_id == "customize-square":
+                    square_customizer_page.active = True
                 if option_id == "play":
                     song_selector.active = True
                     song_selector.reload_songs()
@@ -329,6 +391,12 @@ def main():
                 continue
             if isinstance(import_result, tuple) and import_result[0] == "created":
                 song_selector.reload_songs()
+                continue
+
+            customizer_result = square_customizer_page.handle_event(event)
+            if customizer_result == "back":
+                square_customizer_page.active = False
+                menu.active = True
                 continue
 
             # handle song selector events
@@ -376,6 +444,7 @@ def main():
         menu.draw(screen, n_frames)
         error_screen.draw(screen)
         song_import_page.draw(screen)
+        square_customizer_page.draw(screen)
         live_config.draw(screen, game.active)
 
         update_screen(screen, glsl_program, render_object)
@@ -395,4 +464,6 @@ if __name__ == '__main__':
         raise SystemExit(run_shorts_smoke_test())
     if "--import-smoke-test" in sys.argv:
         raise SystemExit(run_import_smoke_test())
+    if "--customizer-smoke-test" in sys.argv:
+        raise SystemExit(run_customizer_smoke_test())
     main()

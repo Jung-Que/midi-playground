@@ -181,7 +181,7 @@ class Config:
     square_afterimage_count = 4
     square_afterimage_seconds = 0.28
     square_afterimage_rate = 20
-    square_core_shapes = ("diamond", "heart", "star", "circle", "note", "bolt", "cross", "none")
+    square_core_shapes = ("diamond", "heart", "star", "circle", "note", "bolt", "cross", "custom", "none")
     square_core_colors = (
         "accent", "#FFFFFF", "#FF4F91", "#55D9FF", "#FFD166", "#8D7CFF", "#69F0AE", "#FF7043"
     )
@@ -192,6 +192,7 @@ class Config:
     square_core_outline_width = 2
     square_core_rotation_speed = 0
     square_core_pulse_strength = 0.15
+    square_core_image_path = ""
     particle_max_active = 200
     particle_bounce_lifetime = 0.25
     particle_death_lifetime = 0.7
@@ -246,7 +247,7 @@ class Config:
                   "peg_visible_max", "peg_past_fade_seconds", "peg_overlap_padding", "peg_guide_line",
                   "square_core_shape", "square_core_color", "square_core_outline_color",
                   "square_core_scale", "square_core_outline_width", "square_core_rotation_speed",
-                  "square_core_pulse_strength",
+                  "square_core_pulse_strength", "square_core_image_path",
                   "shorts_mode", "shorts_clean_ui", "shorts_segment_start", "shorts_segment_duration",
                   "shorts_loop", "shorts_countdown", "shorts_title_overlay",
                   "performance_hud", "language",
@@ -349,6 +350,8 @@ def sanitize_settings(data: Any) -> tuple[dict[str, Any], list[str]]:
             sanitized = value if value in Config.square_core_shapes else default
         elif name in {"square_core_color", "square_core_outline_color"}:
             sanitized = _valid_color(value, default)
+        elif name == "square_core_image_path":
+            sanitized = value if isinstance(value, str) else default
         elif name == "shader_file_name":
             sanitized = (
                 value if isinstance(value, str) and value.endswith(".glsl")

@@ -355,6 +355,7 @@ class ConfigPage:
                 Config.square_core_outline_width = 2
                 Config.square_core_rotation_speed = 0
                 Config.square_core_pulse_strength = 0.15
+                Config.square_core_image_path = ""
 
                 Config.shorts_mode = False
                 Config.shorts_clean_ui = True
