@@ -68,6 +68,12 @@ diamond, heart, star, circle, note, bolt, cross, or empty inner symbols with ind
 and bounce-pulse settings. these visual options never change the square hitbox or map physics. square speed, bounce spacing, and direction chance regenerate only the
 unplayed portion of the current map, starting from the square's current state.
 
+shorts mode is available from the same `F10` overlay. choose a vertical resolution such as `540x960`, `720x1280`,
+or `1080x1920` on the config page and restart. shorts mode keeps the square and immediate target inside configurable
+recording-safe margins with dynamic camera zoom, can hide gameplay/debug UI, shows a recording countdown and song
+title, and plays a repeatable 15, 30, or 60 second segment from a five-second-adjustable start point. segment and
+mode changes apply when the next song starts; clean UI, title, countdown, duration, and repeat can be changed live.
+
 verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`
 
 ## credits

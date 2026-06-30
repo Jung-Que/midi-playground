@@ -57,6 +57,7 @@ class StreamingTests(unittest.TestCase):
             "square_core_shape": "triangle",
             "square_core_color": "not-a-color",
             "performance_hud": "yes",
+            "shorts_segment_duration": 42,
             "unexpected": "ignored",
         })
 
@@ -66,6 +67,7 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(clean["square_core_shape"], "diamond")
         self.assertEqual(clean["square_core_color"], "accent")
         self.assertTrue(clean["performance_hud"])
+        self.assertEqual(clean["shorts_segment_duration"], 30)
         self.assertNotIn("unexpected", clean)
         self.assertGreaterEqual(len(corrections), 7)
 
@@ -1076,6 +1078,167 @@ class StreamingTests(unittest.TestCase):
         finally:
             Config.square_speed = previous_speed
             Config.music_offset = previous_offset
+
+    def test_shorts_camera_keeps_square_and_target_inside_vertical_safe_area(self):
+        previous = {
+            "shorts_mode": Config.shorts_mode,
+            "SCREEN_WIDTH": Config.SCREEN_WIDTH,
+            "SCREEN_HEIGHT": Config.SCREEN_HEIGHT,
+            "dt": Config.dt,
+        }
+        Config.shorts_mode = True
+        Config.SCREEN_WIDTH = 540
+        Config.SCREEN_HEIGHT = 960
+        Config.dt = 0.25
+        camera = Camera()
+        square = Square(0.0, 0.0, 1, 1)
+        target = [1800.0, 1200.0]
+
+        try:
+            camera.follow(square, target)
+            safe = pygame.Rect(
+                int(Config.SCREEN_WIDTH * Config.shorts_safe_margin_x),
+                int(Config.SCREEN_HEIGHT * Config.shorts_safe_margin_y),
+                int(Config.SCREEN_WIDTH * (1 - 2 * Config.shorts_safe_margin_x)),
+                int(Config.SCREEN_HEIGHT * (1 - 2 * Config.shorts_safe_margin_y)),
+            )
+            self.assertTrue(safe.contains(camera.offset(square.rect)))
+            self.assertTrue(safe.collidepoint(camera.offset(target)))
+            self.assertLess(camera.zoom, 1.0)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_shorts_seek_primes_segment_position_without_particles(self):
+        previous_speed = Config.square_speed
+        Config.square_speed = 600
+        bounces = [
+            ([600.0, 600.0], [-1, 1], 1.0, 0),
+            ([0.0, 1200.0], [-1, -1], 2.0, 1),
+            ([-600.0, 600.0], [1, -1], 3.0, 0),
+        ]
+        prepared = PreparedMap(
+            bounces=bounces,
+            unhit_notes=[1.0, 2.0, 3.0],
+            start_pos=[0.0, 0.0],
+            start_dir=[1, 1],
+        )
+        game = Game()
+        try:
+            game._apply_prepared_map(prepared)
+            resume = game._seek_world_to_map_time(2.5, paused=True)
+
+            self.assertEqual(resume, [-1, -1])
+            self.assertEqual(game.world.square.pos, [-300.0, 900.0])
+            self.assertEqual(game.world.square.dir, [0, 0])
+            self.assertEqual(game.world.completed_bounces, 2)
+            self.assertEqual(len(game.world.particles), 0)
+            self.assertEqual(game.world.scorekeeper.unhit_notes, [3.0])
+        finally:
+            Config.square_speed = previous_speed
+            game.shutdown()
+
+    def test_shorts_playlist_starts_at_configured_segment_without_auto_advance(self):
+        previous = {
+            "shorts_mode": Config.shorts_mode,
+            "shorts_segment_start": Config.shorts_segment_start,
+            "max_notes": Config.max_notes,
+        }
+        Config.shorts_mode = True
+        Config.shorts_segment_start = 5
+        Config.max_notes = 32
+        screen = pygame.display.get_surface()
+        game = Game()
+        game.active = True
+        try:
+            songs = [
+                make_song_from_zip("songs/calm_down.zip"),
+                make_song_from_zip("songs/wii_theme.zip"),
+            ]
+            self.assertIsNone(game.start_playlist(songs, 0, screen))
+            self.assertTrue(game.shorts_session_active)
+            self.assertEqual(game.playback_origin, 5.0)
+            self.assertFalse(game.auto_advance)
+            self.assertEqual(game.world.square.dir, [0, 0])
+        finally:
+            game.shutdown()
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_shorts_segment_end_repeats_or_stops_as_configured(self):
+        previous_duration = Config.shorts_segment_duration
+        previous_loop = Config.shorts_loop
+        game = Game()
+        game.shorts_session_active = True
+        game.playback_origin = 10.0
+        Config.shorts_segment_duration = 15
+        screen = pygame.display.get_surface()
+        restarted = []
+        game._restart_short_segment = lambda _screen: restarted.append(True) or True
+        try:
+            Config.shorts_loop = True
+            self.assertTrue(game._handle_short_segment_end(25.0, screen))
+            self.assertEqual(restarted, [True])
+
+            Config.shorts_loop = False
+            game.shorts_segment_finished = False
+            self.assertFalse(game._handle_short_segment_end(25.0, screen))
+            self.assertTrue(game.shorts_segment_finished)
+            self.assertEqual(game.world.square.dir, [0, 0])
+        finally:
+            game.shutdown()
+            Config.shorts_segment_duration = previous_duration
+            Config.shorts_loop = previous_loop
+
+    def test_shorts_segment_restart_rebuilds_map_and_seeks_real_mp3(self):
+        previous = {
+            "shorts_mode": Config.shorts_mode,
+            "shorts_segment_start": Config.shorts_segment_start,
+            "max_notes": Config.max_notes,
+        }
+        Config.shorts_mode = True
+        Config.shorts_segment_start = 1
+        Config.max_notes = 16
+        song = make_song_from_zip("songs/calm_down.zip")
+        Config.current_song = song
+        game = Game()
+        prepared = prepare_song_map(
+            song_to_spec(song),
+            map_settings_snapshot(),
+            [0.0, 0.0],
+            [1, 1],
+        )
+        game.master_bounce_data = list(prepared.bounces)
+        game.master_unhit_notes = prepared.unhit_notes.copy()
+        game.master_start_pos = prepared.start_pos.copy()
+        game.master_start_dir = prepared.start_dir.copy()
+        game.current_audio_source = read_song_audio(song_to_spec(song))
+        try:
+            self.assertTrue(game._restart_short_segment(pygame.display.get_surface()))
+            self.assertTrue(game.music_has_played)
+            self.assertEqual(game.playback_origin, 1.0)
+            self.assertEqual(game.world.time, 1.0)
+            self.assertEqual(game.shorts_loop_count, 1)
+        finally:
+            game.shutdown()
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_track_end_event_repeats_active_shorts_segment(self):
+        previous_loop = Config.shorts_loop
+        Config.shorts_loop = True
+        game = Game()
+        game.active = True
+        game.shorts_session_active = True
+        restarted = []
+        game._restart_short_segment = lambda _screen: restarted.append(True) or True
+        try:
+            game.handle_event(pygame.event.Event(game_module.TRACK_END_EVENT))
+            self.assertEqual(restarted, [True])
+            self.assertFalse(game.transition_pending)
+        finally:
+            game.shutdown()
+            Config.shorts_loop = previous_loop
 
     def test_live_overlay_opens_and_renders_during_gameplay(self):
         game = Game()

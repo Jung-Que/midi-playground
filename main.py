@@ -59,6 +59,56 @@ def run_stream_smoke_test() -> int:
         pygame.quit()
 
 
+def run_shorts_smoke_test() -> int:
+    """Exercise vertical camera safety, MP3 seeking, and segment replay in a packaged build."""
+    set_resource_root()
+    pygame.init()
+    screen = pygame.display.set_mode((540, 960))
+    Config.screen = screen
+    names = (
+        "SCREEN_WIDTH", "SCREEN_HEIGHT", "shorts_mode", "shorts_segment_start",
+        "shorts_segment_duration", "shorts_loop", "max_notes", "start_playing_delay",
+    )
+    previous = {name: getattr(Config, name) for name in names}
+    Config.SCREEN_WIDTH = 540
+    Config.SCREEN_HEIGHT = 960
+    Config.shorts_mode = True
+    Config.shorts_segment_start = 1
+    Config.shorts_segment_duration = 15
+    Config.shorts_loop = True
+    Config.max_notes = 64
+    Config.start_playing_delay = 0
+    game = Game()
+    game.active = True
+    try:
+        song = make_song_from_zip("songs/calm_down.zip")
+        error = game.start_playlist([song], 0, screen)
+        if error:
+            raise RuntimeError(error)
+        if not game.shorts_session_active or game.auto_advance:
+            raise RuntimeError("Shorts session did not activate cleanly")
+        target = game.world.future_bounces[0].square_pos if game.world.future_bounces else game.world.square.pos
+        game.camera.follow(game.world.square, target)
+        margin_x = round(Config.SCREEN_WIDTH * Config.shorts_safe_margin_x)
+        margin_y = round(Config.SCREEN_HEIGHT * Config.shorts_safe_margin_y)
+        safe = pygame.Rect(
+            margin_x,
+            margin_y,
+            Config.SCREEN_WIDTH - margin_x * 2,
+            Config.SCREEN_HEIGHT - margin_y * 2,
+        )
+        if not safe.contains(game.camera.offset(game.world.square.rect)):
+            raise RuntimeError("Square left the vertical recording-safe area")
+        if not game._restart_short_segment(screen):
+            raise RuntimeError(game.stream_message or "Segment replay failed")
+        return 0
+    finally:
+        game.shutdown()
+        for name, value in previous.items():
+            setattr(Config, name, value)
+        pygame.quit()
+
+
 def main():
     set_resource_root()
 
@@ -286,4 +336,6 @@ if __name__ == '__main__':
     freeze_support()
     if "--stream-smoke-test" in sys.argv:
         raise SystemExit(run_stream_smoke_test())
+    if "--shorts-smoke-test" in sys.argv:
+        raise SystemExit(run_shorts_smoke_test())
     main()

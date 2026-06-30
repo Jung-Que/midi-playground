@@ -745,6 +745,7 @@ class PlaylistController:
         self._invalidate_streams()
         self.slots.clear()
         self.active_slot = None
-        self._audio_executor.shutdown(wait=False, cancel_futures=True)
+        self._audio_executor.shutdown(wait=True, cancel_futures=True)
         if self._map_executor is not None:
-            self._map_executor.shutdown(wait=False, cancel_futures=True)
+            self._map_executor.shutdown(wait=True, cancel_futures=True)
+            self._map_executor = None

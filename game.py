@@ -88,10 +88,21 @@ class Game:
         self._afterimage_layer = None
         self._particle_layer = None
         self.audio_clock = AudioClock(pygame.mixer.music.get_pos)
+        self.playback_origin = 0.0
+        self.shorts_session_active = False
+        self.shorts_resume_direction = [1, 1]
+        self.shorts_segment_finished = False
+        self.shorts_loop_count = 0
+        self.master_bounce_data = []
+        self.master_unhit_notes = []
+        self.master_start_pos = [0.0, 0.0]
+        self.master_start_dir = [1, 1]
+        self.current_audio_source = None
 
     def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
         self.stop_playlist(recreate_controller=True)
         self.consecutive_skips = 0
+        self.shorts_loop_count = 0
         self.playlist.configure(songs, selected_index)
         Config.current_song = songs[selected_index]
         try:
@@ -104,7 +115,7 @@ class Game:
         if result:
             return result
         self.playlist.release_active_audio()
-        self.auto_advance = len(songs) > 1
+        self.auto_advance = len(songs) > 1 and not Config.shorts_mode
         pygame.mixer.music.set_endevent(TRACK_END_EVENT)
         self._prepare_next_song()
 
@@ -137,6 +148,9 @@ class Game:
         self.mouse_down = False
         self.keystrokes = Keystrokes()
         self.stream_message = ""
+        self.shorts_session_active = bool(Config.shorts_mode)
+        self.playback_origin = float(Config.shorts_segment_start) if self.shorts_session_active else 0.0
+        self.shorts_segment_finished = False
 
         if not seamless:
             self.camera = Camera()
@@ -156,6 +170,13 @@ class Game:
                 return f"Unable to generate map: {exc}"
 
         self._apply_prepared_map(prepared)
+        self.master_bounce_data = [
+            (pos.copy(), direction.copy(), timestamp, axis)
+            for pos, direction, timestamp, axis in prepared.bounces
+        ]
+        self.master_unhit_notes = prepared.unhit_notes.copy()
+        self.master_start_pos = prepared.start_pos.copy()
+        self.master_start_dir = prepared.start_dir.copy()
         self.notes = prepared.unhit_notes.copy()
         start_pos = prepared.start_pos.copy()
         start_dir = prepared.start_dir.copy()
@@ -174,16 +195,24 @@ class Game:
                     audio_data, extension = read_song_audio(song_to_spec(Config.current_song))
                 else:
                     audio_data, extension = audio_override
+                self.current_audio_source = (audio_data, extension)
                 self._load_music(audio_data, extension)
             except Exception as exc:
                 return f"Unable to load audio: {exc}"
             self.world.start_time = get_current_time()
-            self.world.square.dir = [0, 0]
-            self.world.square.pos = self.world.future_bounces[0].square_pos.copy()
-            self.world.reset_motion_anchor(self.world.square, 0.0)
+            if self.shorts_session_active:
+                self.shorts_resume_direction = self._seek_world_to_map_time(
+                    self.playback_origin,
+                    paused=True,
+                )
+            else:
+                self.world.square.dir = [0, 0]
+                self.world.square.pos = self.world.future_bounces[0].square_pos.copy()
+                self.world.reset_motion_anchor(self.world.square, 0.0)
 
     def _apply_prepared_map(self, prepared: PreparedMap):
         self.world.square = Square(*prepared.start_pos, *prepared.start_dir)
+        self.world.reset_motion_anchor(self.world.square, 0.0)
         bounces = [Bounce(pos, direction, timestamp, axis) for pos, direction, timestamp, axis in prepared.bounces]
         self.world.future_bounces = deque(bounces)
         self.world.total_bounces = len(bounces)
@@ -194,6 +223,86 @@ class Game:
         self._active_chunk_signature = None
         self._refresh_map_window(0.0, force=True)
 
+    def _seek_world_to_map_time(self, map_time: float, paused: bool = False) -> list[int]:
+        """Fast-forward map state without particles, preserving the planned collision path."""
+        map_time = max(float(map_time), 0.0)
+        while self.world.future_bounces and self.world.future_bounces[0].time <= map_time:
+            bounce = self.world.get_next_bounce()
+            self.world.square.obey_bounce(bounce)
+            self.world.reset_motion_anchor(self.world.square, bounce.time)
+        self.world.sync_square_to_schedule(self.world.square, map_time)
+        self.world.scorekeeper.unhit_notes = [
+            timestamp for timestamp in self.world.scorekeeper.unhit_notes
+            if timestamp >= map_time
+        ]
+        resume_direction = self.world.square.dir.copy()
+        if paused:
+            self.world.square.dir = [0, 0]
+            self.world.reset_motion_anchor(self.world.square, map_time, direction=[0, 0])
+        self.world.time = map_time
+        return resume_direction
+
+    def _shorts_snapshot(self) -> PreparedMap:
+        ordered = sorted(self.master_bounce_data, key=lambda item: item[2])
+        return PreparedMap(
+            bounces=[
+                (position.copy(), direction.copy(), timestamp, axis)
+                for position, direction, timestamp, axis in ordered
+            ],
+            unhit_notes=self.master_unhit_notes.copy(),
+            start_pos=self.master_start_pos.copy(),
+            start_dir=self.master_start_dir.copy(),
+            complete=True,
+        )
+
+    def _shorts_origin_ready(self) -> bool:
+        if not self.shorts_session_active or self.playback_origin <= 0:
+            return True
+        if self.master_bounce_data:
+            latest = max(item[2] for item in self.master_bounce_data)
+            if latest >= self.playback_origin:
+                return True
+        return self.world.map_stream_complete
+
+    def _restart_short_segment(self, screen: pygame.Surface) -> bool:
+        if self.current_audio_source is None or not self.master_bounce_data:
+            self.stream_message = "Unable to repeat shorts segment: source is not ready"
+            return False
+        snapshot = self._shorts_snapshot()
+        result = self.start_song(
+            screen,
+            prepared=snapshot,
+            seamless=True,
+            audio_override=self.current_audio_source,
+        )
+        if result:
+            self.stream_message = str(result)
+            return False
+        pygame.mixer.music.play(start=self.playback_origin)
+        self.audio_clock.start_now(get_current_time())
+        self.music_has_played = True
+        self.world.square.dir = self.shorts_resume_direction.copy()
+        self.world.reset_motion_anchor(self.world.square, self.playback_origin)
+        self.world.time = self.playback_origin
+        self.shorts_loop_count += 1
+        return True
+
+    def _handle_short_segment_end(self, map_time: float, screen: pygame.Surface) -> bool:
+        if not self.shorts_session_active or self.shorts_segment_finished:
+            return False
+        segment_end = self.playback_origin + float(Config.shorts_segment_duration)
+        if map_time < segment_end:
+            return False
+        if Config.shorts_loop:
+            return self._restart_short_segment(screen)
+        pygame.mixer.music.stop()
+        self.music_has_played = False
+        self.shorts_segment_finished = True
+        self.world.square.dir = [0, 0]
+        self.world.reset_motion_anchor(self.world.square, segment_end, direction=[0, 0])
+        self.stream_message = "Shorts segment complete"
+        return False
+
     def _shift_pending_bounce_schedule(self, seconds: float):
         """Apply one shared world-time offset to current and future stream chunks."""
         seconds = float(seconds)
@@ -202,6 +311,11 @@ class Game:
         self.bounce_schedule_offset += seconds
         for bounce in self.world.future_bounces:
             bounce.time += seconds
+        for bounce in self.world.past_bounces:
+            bounce.time += seconds
+        self.world.motion_anchor_time += seconds
+        if self.world.square.last_bounce_time > -99:
+            self.world.square.last_bounce_time += seconds
 
     @staticmethod
     def _square_rect(position: list[float]) -> pygame.Rect:
@@ -224,7 +338,7 @@ class Game:
             })()]
 
         for chunk in source_chunks:
-            chunk_start_position = chunk.start_pos or previous_position
+            chunk_start_position = getattr(chunk, "start_pos", None) or previous_position
             runtime_chunks.append(RuntimeMapChunk(
                 start_time=chunk.start_time,
                 end_time=chunk.end_time,
@@ -337,6 +451,10 @@ class Game:
         chunks = self.playlist.claim_chunks_until(self.active_map_stream, horizon)
         if chunks:
             for chunk in chunks:
+                self.master_bounce_data.extend(
+                    (position.copy(), direction.copy(), timestamp, axis)
+                    for position, direction, timestamp, axis in chunk.bounces
+                )
                 new_bounces = [
                     Bounce(
                         position,
@@ -808,6 +926,52 @@ class Game:
         self.world.particles = alive_particles[-max(int(Config.particle_max_active), 1):]
         screen.blit(self._particle_layer, (0, 0))
 
+    def _draw_shorts_overlays(self, screen: pygame.Surface, map_time: float, time_from_start: float):
+        if not self.shorts_session_active:
+            return
+
+        if Config.shorts_title_overlay and self.music_has_played:
+            elapsed = max(0.0, map_time - self.playback_origin)
+            duration = max(float(Config.shorts_title_seconds), 0.1)
+            if elapsed < duration:
+                fade = min(1.0, elapsed / 0.25, (duration - elapsed) / 0.5)
+                song = Config.current_song
+                title = getattr(song, "name", "Untitled")
+                artist = getattr(song, "song_artist", "")
+                title_font = get_font(max(24, min(42, screen.get_width() // 14)))
+                detail_font = get_font(max(16, min(24, screen.get_width() // 22)))
+                title_surface = title_font.render(title, True, (255, 255, 255))
+                detail_surface = detail_font.render(artist, True, (205, 214, 228)) if artist else None
+                width = min(
+                    screen.get_width() - 32,
+                    max(title_surface.get_width(), detail_surface.get_width() if detail_surface else 0) + 36,
+                )
+                height = title_surface.get_height() + (detail_surface.get_height() + 4 if detail_surface else 0) + 24
+                panel = pygame.Surface((width, height), pygame.SRCALPHA)
+                panel.fill((5, 8, 14, int(185 * fade)))
+                title_surface.set_alpha(int(255 * fade))
+                panel.blit(title_surface, title_surface.get_rect(midtop=(width / 2, 10)))
+                if detail_surface:
+                    detail_surface.set_alpha(int(255 * fade))
+                    panel.blit(detail_surface, detail_surface.get_rect(midtop=(width / 2, 12 + title_surface.get_height())))
+                top = int(screen.get_height() * max(float(Config.shorts_safe_margin_y), 0.05))
+                screen.blit(panel, panel.get_rect(midtop=(screen.get_width() / 2, top)))
+
+        if not Config.shorts_countdown:
+            return
+        label = None
+        alpha = 255
+        if time_from_start < 0:
+            label = str(max(1, ceil(abs(time_from_start))))
+        elif time_from_start < 0.45:
+            label = "GO"
+            alpha = int(255 * (1 - time_from_start / 0.45))
+        if label:
+            font = get_font(max(48, min(96, screen.get_width() // 5)))
+            surface = font.render(label, True, (255, 255, 255))
+            surface.set_alpha(alpha)
+            screen.blit(surface, surface.get_rect(center=(screen.get_width() / 2, screen.get_height() * 0.28)))
+
     def draw(self, screen: pygame.Surface, n_frames: int):
 
         if not self.active:
@@ -815,26 +979,40 @@ class Game:
 
         self._update_playlist_transition()
 
-        if not self.music_has_played:
+        if not self.music_has_played and not self.shorts_segment_finished:
             if not self.offset_happened:
                 self._shift_pending_bounce_schedule(self.play_delay_ms / 1000)
             self.offset_happened = True
-            if self.world.time-Config.current_song.music_offset/1000 > self.play_delay_ms/1000:
+            if self.shorts_session_active:
+                start_delay_elapsed = get_current_time() - self.world.start_time
+            else:
+                start_delay_elapsed = self.world.time - Config.current_song.music_offset / 1000
+            if start_delay_elapsed > self.play_delay_ms/1000 and self._shorts_origin_ready():
                 self.music_has_played = True
                 song_load_before = get_current_time()
-                pygame.mixer.music.play()
+                pygame.mixer.music.play(start=self.playback_origin)
                 self.audio_clock.start_now(get_current_time())
                 self._shift_pending_bounce_schedule(get_current_time() - song_load_before)
+                if self.shorts_session_active:
+                    self.world.square.dir = self.shorts_resume_direction.copy()
+                    self.world.reset_motion_anchor(
+                        self.world.square,
+                        self.playback_origin + self.bounce_schedule_offset,
+                    )
 
         screen_rect = screen.get_rect()
 
         # set world time
         self.world.update_time()
         if self.music_has_played:
-            self.world.time = self.audio_clock.position() + self.play_delay_ms / 1000
+            self.world.time = self.playback_origin + self.audio_clock.position() + self.play_delay_ms / 1000
             self.transition_lag_ms = abs(self.audio_clock.drift_ms)
+        elif self.shorts_session_active:
+            self.world.time += self.playback_origin
         map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
         self._ingest_stream_chunks(map_time)
+        if self._handle_short_segment_end(map_time, screen):
+            map_time = self.playback_origin
 
         # move camera (only works if not locked on square)
         self.camera.attempt_movement()
@@ -845,6 +1023,11 @@ class Game:
         # Keep movement and bounce decisions on one authoritative song timeline.
         schedule_time = (self.world.time * 1000 + Config.music_offset) / 1000
         self.world.sync_square_to_schedule(self.world.square, schedule_time)
+        if self.shorts_session_active and not self.music_has_played and not self.shorts_segment_finished:
+            if self.world.square.dir != [0, 0]:
+                self.shorts_resume_direction = self.world.square.dir.copy()
+            self.world.square.dir = [0, 0]
+            self.world.reset_motion_anchor(self.world.square, schedule_time, direction=[0, 0])
 
         # square in center of camera if locked
         if self.camera.locked_on_square:
@@ -854,7 +1037,7 @@ class Game:
             )
 
         self._prune_rolling_world(screen_rect)
-        world_view = screen_rect.move(int(self.camera.x), int(self.camera.y))
+        world_view = self.camera.world_view(screen_rect)
 
         # bounce anim
         sqrect = self.camera.offset(self.world.square.rect)
@@ -984,7 +1167,8 @@ class Game:
                 
         # scorekeeper drawing
         time_from_start = self.world.time-self.play_delay_ms/1000+Config.music_offset/1000
-        if not Config.theatre_mode:
+        show_gameplay_ui = not Config.theatre_mode and not (Config.shorts_mode and Config.shorts_clean_ui)
+        if show_gameplay_ui:
             self.misses = self.world.scorekeeper.draw(screen, time_from_start if len(self.world.future_bounces) else -1, self.misses)
 
             # hit icons
@@ -1018,16 +1202,16 @@ class Game:
         # draw square
         self.world.square.draw(screen, sqrect)
 
-        if not Config.theatre_mode:
+        if show_gameplay_ui:
             # keystrokes
             self.keystrokes.draw(screen)
 
             # countdown to start
-            if time_from_start < 0:
+            if time_from_start < 0 and not Config.shorts_mode:
                 repr_time = f"{abs(int((time_from_start+0.065)*10)/10)}s"
                 countdown_surface = get_font(36).render(repr_time, True, (255, 255, 255))
                 screen.blit(countdown_surface, countdown_surface.get_rect(center=(Config.SCREEN_WIDTH / 2, Config.SCREEN_HEIGHT / 4)))
-            elif time_from_start < 0.5:
+            elif time_from_start < 0.5 and not Config.shorts_mode:
                 repr_zero = f"0.0s"
                 countdown_surface = get_font(36).render(repr_zero, True, (255, 255, 255))
                 countdown_surface.set_alpha((0.5-time_from_start)*2*255)
@@ -1086,10 +1270,13 @@ class Game:
                 screen.blit(acc_text, acc_text.get_rect(center=(Config.SCREEN_WIDTH / 2, Config.SCREEN_HEIGHT / 4 + 50)))
                 screen.blit(acct_text, acct_text.get_rect(center=(Config.SCREEN_WIDTH / 2, Config.SCREEN_HEIGHT / 4 + 100)))
 
-        if not self.camera.locked_on_square:
+        self._draw_shorts_overlays(screen, map_time, time_from_start - self.playback_origin)
+
+        clean_shorts = Config.shorts_mode and Config.shorts_clean_ui
+        if not self.camera.locked_on_square and not clean_shorts:
             screen.blit(self.camera_ctrl_text, (10, 10))
 
-        if self.stream_message:
+        if self.stream_message and not clean_shorts:
             stream_surface = get_font(18).render(self.stream_message, True, (255, 190, 80))
             screen.blit(stream_surface, stream_surface.get_rect(midtop=(Config.SCREEN_WIDTH / 2, 12)))
 
@@ -1101,7 +1288,7 @@ class Game:
             self.fps_smoothed = instant_fps
         else:
             self.fps_smoothed = self.fps_smoothed * 0.9 + instant_fps * 0.1
-        if not Config.performance_hud:
+        if not Config.performance_hud or (Config.shorts_mode and Config.shorts_clean_ui):
             return
 
         if not tracemalloc.is_tracing():
@@ -1130,10 +1317,13 @@ class Game:
         screen.blit(panel, panel.get_rect(bottomright=(screen.get_width() - 12, screen.get_height() - 12)))
 
     def handle_event(self, event: pygame.event.Event):
-        if event.type == TRACK_END_EVENT and self.active and self.auto_advance:
-            self.transition_pending = True
-            self.transition_started_at = get_current_time()
-            self.transition_wait_started_at = self.transition_started_at
+        if event.type == TRACK_END_EVENT and self.active:
+            if self.shorts_session_active:
+                self._handle_short_segment_end(float("inf"), Config.screen)
+            elif self.auto_advance:
+                self.transition_pending = True
+                self.transition_started_at = get_current_time()
+                self.transition_wait_started_at = self.transition_started_at
             return False
 
         if not self.active:

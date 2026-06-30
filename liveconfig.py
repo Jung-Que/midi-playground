@@ -26,6 +26,13 @@ class LiveConfigOverlay:
         ("Particle amount", "particle_amount"),
         ("Camera mode", "camera_mode"),
         ("Music volume", "volume"),
+        ("Shorts mode (next song)", "shorts_mode"),
+        ("Clean recording UI", "shorts_clean_ui"),
+        ("Segment start", "shorts_segment_start"),
+        ("Segment length", "shorts_segment_duration"),
+        ("Repeat segment", "shorts_loop"),
+        ("Title overlay", "shorts_title_overlay"),
+        ("Recording countdown", "shorts_countdown"),
         ("Map retention", "map_retention_seconds"),
         ("Map reveal fade", "map_fade_seconds"),
         ("Visible peg cap", "peg_visible_max"),
@@ -78,6 +85,10 @@ class LiveConfigOverlay:
             themes = list(Config.color_themes)
             current_index = themes.index(Config.theme) if Config.theme in themes else 0
             Config.theme = themes[(current_index + direction) % len(themes)]
+        elif name in {"shorts_mode", "shorts_clean_ui", "shorts_loop", "shorts_title_overlay", "shorts_countdown"}:
+            setattr(Config, name, not bool(getattr(Config, name)))
+            if name == "shorts_mode" and game.active:
+                game.stream_message = "Shorts mode will apply when the next song starts"
         elif name in {
             "bounce_effect", "do_particles_on_bounce", "particle_trail",
             "do_color_bounce_pegs", "square_glow", "performance_hud", "peg_guide_line",
@@ -120,6 +131,14 @@ class LiveConfigOverlay:
         elif name == "volume":
             Config.volume = max(0, min(100, int(Config.volume) + direction * 5))
             pygame.mixer.music.set_volume(Config.volume / 100)
+        elif name == "shorts_segment_start":
+            Config.shorts_segment_start = max(0, int(Config.shorts_segment_start) + direction * 5)
+            if game.active:
+                game.stream_message = "Segment start will apply when the next song starts"
+        elif name == "shorts_segment_duration":
+            durations = (15, 30, 60)
+            current = Config.shorts_segment_duration if Config.shorts_segment_duration in durations else 30
+            Config.shorts_segment_duration = durations[(durations.index(current) + direction) % len(durations)]
         elif name == "map_retention_seconds":
             Config.map_retention_seconds = max(1, min(30, int(Config.map_retention_seconds) + direction))
         elif name == "map_fade_seconds":
@@ -157,6 +176,11 @@ class LiveConfigOverlay:
             return get_camera_follow(value).name
         if name == "volume":
             return f"{value}%"
+        if name == "shorts_segment_start":
+            minutes, seconds = divmod(int(value), 60)
+            return f"{minutes}:{seconds:02d}"
+        if name == "shorts_segment_duration":
+            return f"{int(value)}s"
         if name == "square_core_shape":
             return str(value).replace("_", " ").title()
         if name in {"square_core_color", "square_core_outline_color"}:
@@ -192,8 +216,9 @@ class LiveConfigOverlay:
             self.active = False
             return
 
-        hint = get_font(18).render("F10: live settings", True, (255, 255, 255))
-        screen.blit(hint, hint.get_rect(topright=(Config.SCREEN_WIDTH - 15, 15)))
+        if not (Config.shorts_mode and Config.shorts_clean_ui and not self.active):
+            hint = get_font(18).render("F10: live settings", True, (255, 255, 255))
+            screen.blit(hint, hint.get_rect(topright=(Config.SCREEN_WIDTH - 15, 15)))
         if not self.active:
             return
 

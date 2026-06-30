@@ -205,6 +205,19 @@ class Config:
     audio_clock_max_probe_ms = 5000
     performance_hud = True
 
+    # vertical creator / shorts mode
+    shorts_mode = False
+    shorts_clean_ui = True
+    shorts_segment_start = 0
+    shorts_segment_duration = 30
+    shorts_loop = True
+    shorts_countdown = True
+    shorts_title_overlay = True
+    shorts_title_seconds = 3.0
+    shorts_safe_margin_x = 0.12
+    shorts_safe_margin_y = 0.10
+    shorts_min_zoom = 0.10
+
     # settings that are not configurable (yet)
     backtrack_chance: Optional[float] = 0.02
     backtrack_amount: Optional[int] = 40
@@ -234,6 +247,8 @@ class Config:
                   "square_core_shape", "square_core_color", "square_core_outline_color",
                   "square_core_scale", "square_core_outline_width", "square_core_rotation_speed",
                   "square_core_pulse_strength",
+                  "shorts_mode", "shorts_clean_ui", "shorts_segment_start", "shorts_segment_duration",
+                  "shorts_loop", "shorts_countdown", "shorts_title_overlay",
                   "performance_hud", "language",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
@@ -251,6 +266,7 @@ DEFAULT_SETTINGS = {name: getattr(Config, name) for name in Config.save_attrs}
 _BOOLEAN_SETTINGS = {
     "theatre_mode", "particle_trail", "do_color_bounce_pegs", "do_particles_on_bounce",
     "bounce_effect", "square_glow", "peg_guide_line", "performance_hud",
+    "shorts_mode", "shorts_clean_ui", "shorts_loop", "shorts_countdown", "shorts_title_overlay",
 }
 _INTEGER_RANGES = {
     "camera_mode": (0, 4),
@@ -267,6 +283,8 @@ _INTEGER_RANGES = {
     "peg_overlap_padding": (0, 50),
     "square_core_outline_width": (0, 6),
     "square_core_rotation_speed": (-180, 180),
+    "shorts_segment_start": (0, 86_400),
+    "shorts_segment_duration": (15, 60),
     "SCREEN_WIDTH": (320, 7_680),
     "SCREEN_HEIGHT": (240, 4_320),
 }
@@ -315,6 +333,8 @@ def sanitize_settings(data: Any) -> tuple[dict[str, Any], list[str]]:
         value = data.get(name, default)
         if name in _BOOLEAN_SETTINGS:
             sanitized = value if isinstance(value, bool) else default
+        elif name == "shorts_segment_duration":
+            sanitized = value if value in (15, 30, 60) else default
         elif name in _INTEGER_RANGES:
             sanitized = _clamped_number(value, default, *_INTEGER_RANGES[name], integer=True)
         elif name in _FLOAT_RANGES:

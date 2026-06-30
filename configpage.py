@@ -234,7 +234,7 @@ class ConfigPage:
         )
         self.s_resolution = pgui.elements.UIDropDownMenu(
             [str(Config.rSCREEN_WIDTH) + "x" + str(Config.rSCREEN_HEIGHT), "800x600", "1024x768", "1280x720",
-             "1920x1080"],
+             "1920x1080", "540x960", "720x1280", "1080x1920"],
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH * 5 / 10, Config.SCREEN_HEIGHT * 8 // 10, 300, 30)),
             starting_option=str(Config.SCREEN_WIDTH) + "x" + str(Config.SCREEN_HEIGHT),
             manager=self.ui_manager
@@ -356,6 +356,14 @@ class ConfigPage:
                 Config.square_core_rotation_speed = 0
                 Config.square_core_pulse_strength = 0.15
 
+                Config.shorts_mode = False
+                Config.shorts_clean_ui = True
+                Config.shorts_segment_start = 0
+                Config.shorts_segment_duration = 30
+                Config.shorts_loop = True
+                Config.shorts_countdown = True
+                Config.shorts_title_overlay = True
+
                 Config.SCREEN_WIDTH = Config.rSCREEN_WIDTH
                 Config.SCREEN_HEIGHT = Config.rSCREEN_HEIGHT
 
@@ -380,6 +388,8 @@ class ConfigPage:
             if event.ui_element == self.s_resolution:
                 event.text = event.text.split("x")
                 Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT = int(event.text[0]), int(event.text[1])
+                if Config.SCREEN_HEIGHT > Config.SCREEN_WIDTH:
+                    Config.shorts_mode = True
 
         if event.type == pgui.UI_TEXT_ENTRY_CHANGED:
             if event.ui_element == self.s_seed:
