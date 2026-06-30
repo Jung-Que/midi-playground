@@ -10,3 +10,4 @@ main.spec
 /exports/
 /logs/
 /presets-local/
+/.release-*/

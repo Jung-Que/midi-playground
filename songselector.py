@@ -6,6 +6,7 @@ from typing import Any
 from io import BytesIO
 from json import loads
 import pygame
+from paths import resource_path, user_path
 
 
 class Song:
@@ -163,11 +164,12 @@ class SongSelector:
     def reload_songs(self):
         self.songs = []
         for directory in self.SONG_DIRECTORIES:
-            if not isdir(directory):
+            resolved_directory = user_path(directory) if directory == "songs-local" else resource_path(directory)
+            if not isdir(resolved_directory):
                 continue
             local_only = directory == "songs-local"
-            for song_name in reversed(listdir(directory)):
-                path = join(directory, song_name)
+            for song_name in reversed(listdir(resolved_directory)):
+                path = join(resolved_directory, song_name)
                 if isfile(path):
                     if path.lower().endswith(".zip") or path.lower().endswith(".midiplayground"):
                         self.songs.append(make_song_from_zip(path, local_only=local_only))

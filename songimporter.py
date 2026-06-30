@@ -11,6 +11,7 @@ import wave
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 import mido
+from paths import resource_path, user_path
 
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg"}
@@ -203,8 +204,9 @@ def _fingerprint_from_pack(path: Path) -> str | None:
 
 def find_duplicate_song(
         fingerprint: str,
-        directories: tuple[Path, ...] = (Path("songs-local"), Path("songs")),
+        directories: tuple[Path, ...] | None = None,
 ) -> Path | None:
+    directories = directories or (user_path("songs-local"), resource_path("songs"))
     for directory in directories:
         if not directory.is_dir():
             continue
@@ -223,7 +225,7 @@ def safe_song_slug(title: str, fingerprint: str) -> str:
 
 def create_song_pack(
         request: SongImportRequest,
-        output_directory: Path = Path("songs-local"),
+        output_directory: Path | None = None,
         bounce_spacing_ms: float = 30,
         duplicate_directories: tuple[Path, ...] | None = None,
 ) -> SongImportResult:
@@ -237,8 +239,9 @@ def create_song_pack(
     if not mapper:
         raise SongImportError("Mapper/importer name is required")
 
+    output_directory = Path(output_directory) if output_directory is not None else user_path("songs-local")
     analysis = analyze_song_import(request, bounce_spacing_ms)
-    directories = duplicate_directories or (output_directory, Path("songs"))
+    directories = duplicate_directories or (output_directory, resource_path("songs"))
     duplicate = find_duplicate_song(analysis.fingerprint, tuple(Path(item) for item in directories))
     if duplicate is not None:
         raise DuplicateSongError(duplicate)
@@ -246,7 +249,6 @@ def create_song_pack(
     audio_path = Path(request.audio_path).expanduser().resolve()
     midi_path = Path(request.midi_path).expanduser().resolve()
     slug = safe_song_slug(title, analysis.fingerprint)
-    output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
     output_path = output_directory / f"{slug}.zip"
     if output_path.exists():

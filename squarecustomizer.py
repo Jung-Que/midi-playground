@@ -9,6 +9,7 @@ from tempfile import NamedTemporaryFile
 import pygame
 
 from config import Config
+from paths import user_path
 
 
 STYLE_FIELDS = (
@@ -161,20 +162,21 @@ def _atomic_json_write(path: Path, data: dict):
             temporary_path.unlink(missing_ok=True)
 
 
-def save_user_preset(name: str, directory: Path = Path("presets-local/square")) -> Path:
+def save_user_preset(name: str, directory: Path | None = None) -> Path:
+    directory = Path(directory) if directory is not None else user_path("presets-local", "square")
     path = Path(directory) / f"{_safe_name(name)}.json"
     _atomic_json_write(path, snapshot_style())
     return path
 
 
-def user_presets(directory: Path = Path("presets-local/square")) -> dict[str, Path]:
-    directory = Path(directory)
+def user_presets(directory: Path | None = None) -> dict[str, Path]:
+    directory = Path(directory) if directory is not None else user_path("presets-local", "square")
     if not directory.is_dir():
         return {}
     return {path.stem: path for path in sorted(directory.glob("*.json"))}
 
 
-def load_preset(name: str, directory: Path = Path("presets-local/square")) -> StyleValidation:
+def load_preset(name: str, directory: Path | None = None) -> StyleValidation:
     if name in BUILTIN_PRESETS:
         return apply_style(BUILTIN_PRESETS[name])
     path = user_presets(directory).get(name)
@@ -201,7 +203,7 @@ def import_style_json(path: Path) -> StyleValidation:
 
 def install_custom_png(
         source: Path,
-        asset_directory: Path = Path("presets-local/square/assets"),
+        asset_directory: Path | None = None,
 ) -> Path:
     source = Path(source).expanduser().resolve()
     if source.suffix.lower() != ".png" or not source.is_file():
@@ -222,7 +224,10 @@ def install_custom_png(
         raise SquareStyleError("PNG dimensions must not exceed 4096x4096")
 
     digest = sha256(source.read_bytes()).hexdigest()[:16]
-    asset_directory = Path(asset_directory)
+    asset_directory = (
+        Path(asset_directory) if asset_directory is not None
+        else user_path("presets-local", "square", "assets")
+    )
     asset_directory.mkdir(parents=True, exist_ok=True)
     destination = asset_directory / f"core-{digest}.png"
     if not destination.exists():

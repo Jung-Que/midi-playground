@@ -23,6 +23,7 @@ from songimporter import (
     find_duplicate_song,
 )
 from utils import get_font
+from paths import user_path
 
 
 class SongImportPage:
@@ -213,7 +214,7 @@ class SongImportPage:
         try:
             result = create_song_pack(
                 self._request(),
-                output_directory=Path("songs-local"),
+                output_directory=user_path("songs-local"),
                 bounce_spacing_ms=Config.bounce_min_spacing,
             )
             self.created_path = result.output_path

@@ -1,3 +1,19 @@
+from os import chdir
+from pathlib import Path
+import sys
+import subprocess
+
+
+def set_resource_root():
+    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    chdir(resource_root)
+
+
+# Config is imported by most UI modules and loads settings immediately. Set the
+# resource root before those imports so packaged launches never depend on the
+# caller's working directory.
+set_resource_root()
+
 from diagnostics import install_exception_logging
 
 install_exception_logging()
@@ -11,22 +27,15 @@ from songimportpage import SongImportPage
 from squarecustomizerpage import SquareCustomizerPage
 from errorscreen import ErrorScreen
 from liveconfig import LiveConfigOverlay
-from os import chdir, getcwd
 from platform import system as get_os
-from pathlib import Path
-import sys
 from config import save_to_file
+from paths import user_path
 import debuginfo
 import webbrowser
 import pygame
 from array import array
 from time import monotonic, sleep
-
-
-def set_resource_root():
-    resource_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    chdir(resource_root)
-
+from version import __version__
 
 def run_stream_smoke_test() -> int:
     """Exercise packaged multiprocessing map streaming without opening the full UI."""
@@ -200,6 +209,25 @@ def run_customizer_smoke_test() -> int:
         pygame.quit()
 
 
+def run_release_smoke_test() -> int:
+    """Run every feature check with a fresh pygame process."""
+    checks = (
+        "--stream-smoke-test",
+        "--shorts-smoke-test",
+        "--import-smoke-test",
+        "--customizer-smoke-test",
+    )
+    for argument in checks:
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, argument]
+        else:
+            command = [sys.executable, str(Path(__file__).resolve()), argument]
+        result = subprocess.run(command, cwd=Path.cwd(), check=False)
+        if result.returncode:
+            return result.returncode
+    return 0
+
+
 def main():
     set_resource_root()
 
@@ -365,7 +393,9 @@ def main():
             option_id = menu.handle_event(event)
             if option_id:
                 if option_id == "open-songs-folder":
-                    open_file(join(getcwd(), "songs"))
+                    local_songs = user_path("songs-local")
+                    local_songs.mkdir(parents=True, exist_ok=True)
+                    open_file(str(local_songs))
                     continue
                 if option_id == "contribute":
                     webbrowser.open("https://github.com/quasar098/midi-playground")
@@ -458,6 +488,11 @@ def main():
 if __name__ == '__main__':
     from multiprocessing import freeze_support
     freeze_support()
+    if "--version" in sys.argv:
+        print(__version__)
+        raise SystemExit(0)
+    if "--release-smoke-test" in sys.argv:
+        raise SystemExit(run_release_smoke_test())
     if "--stream-smoke-test" in sys.argv:
         raise SystemExit(run_stream_smoke_test())
     if "--shorts-smoke-test" in sys.argv:

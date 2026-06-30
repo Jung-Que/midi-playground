@@ -41,7 +41,9 @@ shape presets, colour pickers, size/outline/rotation/bounce-pulse controls, tran
 local preset saving, and JSON import/export. custom images and presets are copied under `presets-local/`, which is
 ignored by git. invalid or missing image files fall back to the diamond symbol without changing the hitbox.
 
-invalid or outdated values in `assets/settings.json` are clamped or restored during startup. source runs write
+invalid or outdated values in `assets/settings.json` are clamped or restored during startup. packaged Windows
+runs keep settings, local songs, and square presets under `%LOCALAPPDATA%/MidiPlayground`, separate from bundled
+public resources. source runs write
 rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
 `%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.
 
@@ -84,7 +86,16 @@ recording-safe margins with dynamic camera zoom, can hide gameplay/debug UI, sho
 title, and plays a repeatable 15, 30, or 60 second segment from a five-second-adjustable start point. segment and
 mode changes apply when the next song starts; clean UI, title, countdown, duration, and repeat can be changed live.
 
-verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`
+## verified Windows release
+
+run `python tools/build_release.py` from the repository root. the release builder runs all unit tests, copies only
+the public files allow-listed in `packaging/release-manifest.txt`, builds the Windows application, launches the
+packaged streaming/shorts/import/customizer smoke suite from outside its install directory, rejects private data,
+and writes a versioned ZIP plus SHA-256 file under `exports/releases/`.
+
+when adding a redistribution-cleared built-in song or asset, add its path to the release manifest. files under
+`songs-local/`, `imports-local/`, `presets-local/`, `exports/`, logs, and user settings are never release inputs.
+see [docs/RELEASE.md](docs/RELEASE.md) for the complete checklist.
 
 ## credits
 

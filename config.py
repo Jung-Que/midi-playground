@@ -5,6 +5,8 @@ from json import load, dump
 import logging
 from math import isfinite
 from os.path import isfile
+from pathlib import Path
+from paths import settings_path
 
 pygame.init()
 
@@ -375,19 +377,22 @@ def get_colors():
     return Config.color_themes.get(Config.theme, Config.color_themes["dark"])
 
 
-def save_to_file(dat: Optional[dict[str, Any]] = None, path: str = "./assets/settings.json"):
+def save_to_file(dat: Optional[dict[str, Any]] = None, path: str | Path | None = None):
+    path = Path(path) if path is not None else settings_path()
     if dat is None:
         dat = {k: getattr(Config, k) for k in Config.save_attrs}
-    with open(path, "w") as f:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
         dump(dat, f, indent=4)
 
 
-def load_from_file(path: str = "./assets/settings.json"):
+def load_from_file(path: str | Path | None = None):
+    path = Path(path) if path is not None else settings_path()
     logger = logging.getLogger("midi_playground.settings")
     read_failed = False
     try:
         if isfile(path):
-            with open(path, "r") as f:
+            with path.open("r", encoding="utf-8") as f:
                 data = load(f)
         else:
             data = {}

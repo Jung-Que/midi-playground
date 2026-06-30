@@ -1,9 +1,9 @@
 import logging
 from logging.handlers import RotatingFileHandler
-import os
 from pathlib import Path
 import sys
 import threading
+from paths import user_data_root
 
 
 _installed = False
@@ -11,11 +11,7 @@ _log_path = None
 
 
 def log_directory() -> Path:
-    if getattr(sys, "frozen", False):
-        base = Path(os.environ.get("LOCALAPPDATA", Path(sys.executable).resolve().parent)) / "MidiPlayground"
-    else:
-        base = Path(__file__).resolve().parent
-    return base / "logs"
+    return user_data_root() / "logs"
 
 
 def install_exception_logging() -> Path:

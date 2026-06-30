@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -20,7 +21,8 @@ import game as game_module
 from audioclock import AudioClock
 from bounce import Bounce
 from camera import Camera
-from config import Config, load_from_file, sanitize_settings
+from config import Config, load_from_file, sanitize_settings, save_to_file
+from paths import resource_path, settings_path, user_path
 from configpage import CAMERA_MODE_LABELS, ConfigPage
 from game import Game
 from liveconfig import LiveConfigOverlay
@@ -112,6 +114,19 @@ class StreamingTests(unittest.TestCase):
         finally:
             for name, value in previous.items():
                 setattr(Config, name, value)
+
+    def test_user_data_override_separates_writes_from_resources(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with patch.dict(os.environ, {"MIDI_PLAYGROUND_DATA_DIR": str(root)}):
+                self.assertEqual(settings_path(), root / "settings.json")
+                self.assertEqual(user_path("songs-local"), root / "songs-local")
+                self.assertEqual(resource_path("songs"), Path(__file__).resolve().parents[1] / "songs")
+                save_to_file({"square_speed": 600})
+                self.assertEqual(
+                    json.loads((root / "settings.json").read_text(encoding="utf-8")),
+                    {"square_speed": 600},
+                )
 
     def test_prepares_serializable_map(self):
         previous_max_notes = Config.max_notes
