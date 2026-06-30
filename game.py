@@ -167,6 +167,7 @@ class Game:
             self.audio_clock.start_now(self.world.start_time)
             self.world.square.pos = start_pos.copy()
             self.world.square.dir = start_dir.copy()
+            self.world.reset_motion_anchor(self.world.square, 0.0)
         else:
             try:
                 if audio_override is None:
@@ -179,6 +180,7 @@ class Game:
             self.world.start_time = get_current_time()
             self.world.square.dir = [0, 0]
             self.world.square.pos = self.world.future_bounces[0].square_pos.copy()
+            self.world.reset_motion_anchor(self.world.square, 0.0)
 
     def _apply_prepared_map(self, prepared: PreparedMap):
         self.world.square = Square(*prepared.start_pos, *prepared.start_dir)
@@ -478,6 +480,9 @@ class Game:
         self.map_chunks = self._build_runtime_chunks(prepared)
         self._active_chunk_signature = None
         self._refresh_map_window(map_time, force=True)
+
+        schedule_time = (self.world.time * 1000 + Config.music_offset) / 1000
+        self.world.reset_motion_anchor(self.world.square, schedule_time)
 
         end_pos, end_dir = self._end_state()
         self.playlist.refresh_next_map(end_pos, end_dir)
@@ -837,8 +842,9 @@ class Game:
         # handle square bounces
         self.world.handle_bouncing(self.world.square)
 
-        # move square
-        self.world.square.reg_move()
+        # Keep movement and bounce decisions on one authoritative song timeline.
+        schedule_time = (self.world.time * 1000 + Config.music_offset) / 1000
+        self.world.sync_square_to_schedule(self.world.square, schedule_time)
 
         # square in center of camera if locked
         if self.camera.locked_on_square:

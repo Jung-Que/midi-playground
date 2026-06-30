@@ -26,6 +26,9 @@ class World:
         self.particles: list[Particle] = []
         self.timestamps = []
         self.square = Square()
+        self.motion_anchor_pos = self.square.pos.copy()
+        self.motion_anchor_dir = self.square.dir.copy()
+        self.motion_anchor_time = 0.0
         self.scorekeeper = Scorekeeper(self)
         self.colors = []
         self.geometry_index = SpatialHash(Config.spatial_cell_size)
@@ -77,11 +80,38 @@ class World:
             )
             self.particles.append(new)
 
+    def reset_motion_anchor(
+            self,
+            square: Square,
+            schedule_time: float,
+            direction: list[int] = None,
+    ):
+        """Anchor deterministic movement to the same timeline as planned bounces."""
+        self.motion_anchor_pos = square.pos.copy()
+        self.motion_anchor_dir = (direction if direction is not None else square.dir).copy()
+        self.motion_anchor_time = float(schedule_time)
+
+    def sync_square_to_schedule(self, square: Square, schedule_time: float):
+        """Derive position from song time so frame stalls cannot move through a wall."""
+        elapsed = max(float(schedule_time) - self.motion_anchor_time, 0.0)
+        if self.future_bounces:
+            segment_seconds = max(self.future_bounces[0].time - self.motion_anchor_time, 0.0)
+            elapsed = min(elapsed, segment_seconds)
+
+        square.pos = [
+            self.motion_anchor_pos[axis]
+            + self.motion_anchor_dir[axis] * Config.square_speed * elapsed
+            for axis in range(2)
+        ]
+        square.dir = self.motion_anchor_dir.copy()
+
     def handle_bouncing(self, square: Square):
-        while self.future_bounces and (self.time * 1000 + Config.music_offset) / 1000 > self.future_bounces[0].time:
+        schedule_time = (self.time * 1000 + Config.music_offset) / 1000
+        while self.future_bounces and schedule_time >= self.future_bounces[0].time:
             current_bounce = self.get_next_bounce()
             before = square.dir.copy()
             square.obey_bounce(current_bounce)
+            self.reset_motion_anchor(square, current_bounce.time)
             changed = square.dir.copy()
             for axis in range(2):
                 if before[axis] == changed[axis]:
@@ -95,6 +125,7 @@ class World:
             if not self.future_bounces and self.map_stream_complete:
                 square.dir = [0, 0]
                 square.pos = current_bounce.square_pos
+                self.reset_motion_anchor(square, current_bounce.time)
 
     def handle_keypress(self, time_from_start, misses):
         return self.scorekeeper.do_keypress(time_from_start, misses)

@@ -1,3 +1,7 @@
+from diagnostics import install_exception_logging
+
+install_exception_logging()
+
 from utils import *
 from menu import Menu
 from game import Game

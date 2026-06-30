@@ -31,6 +31,10 @@ private or rights-unverified song packs can be placed in `songs-local/`. they ap
 a `[LOCAL ONLY]` label, but `songs-local/`, `imports-local/`, and `exports/` are ignored by git and omitted from the
 verified package build. only redistribution-cleared packs belong in the tracked `songs/` directory.
 
+invalid or outdated values in `assets/settings.json` are clamped or restored during startup. source runs write
+rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
+`%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.
+
 ## continuous playback and live settings
 
 choosing a song starts a continuous playlist from that song. while the current song is playing, maps and audio
@@ -59,7 +63,9 @@ quantized and cached instead of rebuilding the OpenCV bloom on every frame.
 
 press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
 left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, map retention, peg count,
-peg spacing, target guide, and fades can be changed without stopping playback. square speed, bounce spacing, and direction chance regenerate only the
+peg spacing, target guide, and fades can be changed without stopping playback. the square's fixed outer body can use
+diamond, heart, star, circle, note, bolt, cross, or empty inner symbols with independent fill, outline, size, rotation,
+and bounce-pulse settings. these visual options never change the square hitbox or map physics. square speed, bounce spacing, and direction chance regenerate only the
 unplayed portion of the current map, starting from the square's current state.
 
 verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`

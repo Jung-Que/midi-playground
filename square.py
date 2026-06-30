@@ -6,6 +6,7 @@ from utils import *
 import pygame
 from pygame import Color
 from bounce import Bounce
+from math import cos, pi, sin
 
 
 class Square:
@@ -108,6 +109,133 @@ class Square:
         square_color_index = round((self.dir_x + 1) / 2 + self.dir_y + 1)
         return pygame.Color(palette[square_color_index % len(palette)])
 
+    @staticmethod
+    def _configured_color(value, accent: pygame.Color) -> pygame.Color:
+        if str(value).lower() == "accent":
+            return pygame.Color(accent)
+        try:
+            return pygame.Color(value)
+        except (TypeError, ValueError):
+            return pygame.Color(accent)
+
+    @staticmethod
+    def _shape_points(shape: str, center: tuple[float, float], radius: float):
+        cx, cy = center
+        normalized = {
+            "diamond": ((0, -1), (1, 0), (0, 1), (-1, 0)),
+            "heart": (
+                (0, 1), (-0.88, 0.18), (-1, -0.3), (-0.72, -0.72),
+                (-0.3, -0.78), (0, -0.42), (0.3, -0.78), (0.72, -0.72),
+                (1, -0.3), (0.88, 0.18),
+            ),
+            "bolt": (
+                (0.05, -1), (-0.65, 0.08), (-0.12, 0.08), (-0.35, 1),
+                (0.72, -0.22), (0.18, -0.22),
+            ),
+            "cross": (
+                (-0.3, -1), (0.3, -1), (0.3, -0.3), (1, -0.3),
+                (1, 0.3), (0.3, 0.3), (0.3, 1), (-0.3, 1),
+                (-0.3, 0.3), (-1, 0.3), (-1, -0.3), (-0.3, -0.3),
+            ),
+        }.get(shape)
+        if shape == "star":
+            normalized = tuple(
+                (
+                    cos(-pi / 2 + index * pi / 5) * (1 if index % 2 == 0 else 0.45),
+                    sin(-pi / 2 + index * pi / 5) * (1 if index % 2 == 0 else 0.45),
+                )
+                for index in range(10)
+            )
+        if normalized is None:
+            return []
+        return [(cx + x * radius, cy + y * radius) for x, y in normalized]
+
+    @staticmethod
+    def _draw_note(
+            surface: pygame.Surface,
+            center: tuple[int, int],
+            radius: int,
+            fill: pygame.Color,
+            outline: pygame.Color,
+            outline_width: int,
+    ):
+        cx, cy = center
+        head_center = (int(cx - radius * 0.38), int(cy + radius * 0.48))
+        head_radius = max(2, int(radius * 0.34))
+        stem_x = int(cx - radius * 0.08)
+        stem_top = int(cy - radius * 0.9)
+        stem_bottom = int(cy + radius * 0.45)
+        stem_width = max(2, int(radius * 0.22))
+        flag = [
+            (stem_x, stem_top),
+            (int(cx + radius * 0.75), int(cy - radius * 0.62)),
+            (int(cx + radius * 0.68), int(cy - radius * 0.12)),
+            (stem_x, int(cy - radius * 0.42)),
+        ]
+
+        if outline_width > 0:
+            pygame.draw.circle(surface, outline, head_center, head_radius + outline_width)
+            pygame.draw.line(
+                surface, outline, (stem_x, stem_bottom), (stem_x, stem_top),
+                stem_width + outline_width * 2,
+            )
+            pygame.draw.polygon(surface, outline, flag)
+        pygame.draw.circle(surface, fill, head_center, head_radius)
+        pygame.draw.line(surface, fill, (stem_x, stem_bottom), (stem_x, stem_top), stem_width)
+        if outline_width > 0:
+            inset_flag = [
+                (stem_x, stem_top + outline_width),
+                (int(cx + radius * 0.68), int(cy - radius * 0.57)),
+                (int(cx + radius * 0.61), int(cy - radius * 0.21)),
+                (stem_x, int(cy - radius * 0.46)),
+            ]
+            pygame.draw.polygon(surface, fill, inset_flag)
+        else:
+            pygame.draw.polygon(surface, fill, flag)
+
+    def _draw_custom_core(
+            self,
+            screen: pygame.Surface,
+            sqrect: pygame.Rect,
+            center: tuple[int, int],
+            accent: pygame.Color,
+    ):
+        shape = str(Config.square_core_shape).lower()
+        if shape not in Config.square_core_shapes or shape == "none":
+            return
+
+        bounce_age = (pygame.time.get_ticks() - self.time_since_glow_start) / 1000
+        pulse = 1.0
+        if 0 <= bounce_age < 0.2:
+            pulse += max(0.0, float(Config.square_core_pulse_strength)) * (1 - bounce_age / 0.2)
+        scale = max(0.2, min(float(Config.square_core_scale), 0.75))
+        radius = max(3, int(min(sqrect.width, sqrect.height) * scale * pulse / 2))
+        outline_width = max(0, min(int(Config.square_core_outline_width), 6))
+        fill = self._configured_color(Config.square_core_color, accent)
+        outline = self._configured_color(Config.square_core_outline_color, accent)
+        side = max(12, int(radius * 3 + outline_width * 4))
+        symbol = pygame.Surface((side, side), pygame.SRCALPHA)
+        local_center = (side // 2, side // 2)
+
+        if shape == "circle":
+            pygame.draw.circle(symbol, fill, local_center, radius)
+            if outline_width:
+                pygame.draw.circle(symbol, outline, local_center, radius, outline_width)
+        elif shape == "note":
+            self._draw_note(symbol, local_center, radius, fill, outline, outline_width)
+        else:
+            points = self._shape_points(shape, local_center, radius)
+            if not points:
+                return
+            pygame.draw.polygon(symbol, fill, points)
+            if outline_width:
+                pygame.draw.polygon(symbol, outline, points, outline_width)
+
+        rotation = float(Config.square_core_rotation_speed) * pygame.time.get_ticks() / 1000
+        if rotation:
+            symbol = pygame.transform.rotozoom(symbol, -rotation, 1.0)
+        screen.blit(symbol, symbol.get_rect(center=center))
+
     def _draw_neon_core(self, screen: pygame.Surface, sqrect: pygame.Rect):
         accent = self.accent_color()
         background = pygame.Color(get_colors()["background"])
@@ -132,13 +260,7 @@ class Square:
 
         center_x = sqrect.centerx + int(self.dir_x * sqrect.width * 0.08)
         center_y = sqrect.centery + int(self.dir_y * sqrect.height * 0.08)
-        radius = max(3, int(min(sqrect.width, sqrect.height) * 0.14))
-        pygame.draw.polygon(screen, edge_color, [
-            (center_x, center_y - radius),
-            (center_x + radius, center_y),
-            (center_x, center_y + radius),
-            (center_x - radius, center_y),
-        ])
+        self._draw_custom_core(screen, sqrect, (center_x, center_y), accent)
 
         bounce_age = (pygame.time.get_ticks() - self.time_since_glow_start) / 1000
         if 0 <= bounce_age < 0.15:

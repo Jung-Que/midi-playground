@@ -2,6 +2,8 @@ import moderngl
 import pygame
 from typing import Optional, Any
 from json import load, dump
+import logging
+from math import isfinite
 from os.path import isfile
 
 pygame.init()
@@ -179,6 +181,17 @@ class Config:
     square_afterimage_count = 4
     square_afterimage_seconds = 0.28
     square_afterimage_rate = 20
+    square_core_shapes = ("diamond", "heart", "star", "circle", "note", "bolt", "cross", "none")
+    square_core_colors = (
+        "accent", "#FFFFFF", "#FF4F91", "#55D9FF", "#FFD166", "#8D7CFF", "#69F0AE", "#FF7043"
+    )
+    square_core_shape = "diamond"
+    square_core_color = "accent"
+    square_core_outline_color = "#FFFFFF"
+    square_core_scale = 0.42
+    square_core_outline_width = 2
+    square_core_rotation_speed = 0
+    square_core_pulse_strength = 0.15
     particle_max_active = 200
     particle_bounce_lifetime = 0.25
     particle_death_lifetime = 0.7
@@ -218,6 +231,9 @@ class Config:
                   "do_particles_on_bounce", "bounce_effect", "square_glow", "glow_intensity",
                   "particle_amount", "map_retention_seconds", "map_fade_seconds",
                   "peg_visible_max", "peg_past_fade_seconds", "peg_overlap_padding", "peg_guide_line",
+                  "square_core_shape", "square_core_color", "square_core_outline_color",
+                  "square_core_scale", "square_core_outline_width", "square_core_rotation_speed",
+                  "square_core_pulse_strength",
                   "performance_hud", "language",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
@@ -230,29 +246,146 @@ class Config:
     glow_color = pygame.Color(255, 255, 255)
 
 
+DEFAULT_SETTINGS = {name: getattr(Config, name) for name in Config.save_attrs}
+
+_BOOLEAN_SETTINGS = {
+    "theatre_mode", "particle_trail", "do_color_bounce_pegs", "do_particles_on_bounce",
+    "bounce_effect", "square_glow", "peg_guide_line", "performance_hud",
+}
+_INTEGER_RANGES = {
+    "camera_mode": (0, 4),
+    "start_playing_delay": (0, 10_000),
+    "square_speed": (100, 2_000),
+    "volume": (0, 100),
+    "music_offset": (-5_000, 5_000),
+    "direction_change_chance": (0, 100),
+    "hp_drain_rate": (0, 100),
+    "glow_intensity": (1, 40),
+    "particle_amount": (0, 50),
+    "map_retention_seconds": (1, 60),
+    "peg_visible_max": (1, 20),
+    "peg_overlap_padding": (0, 50),
+    "square_core_outline_width": (0, 6),
+    "square_core_rotation_speed": (-180, 180),
+    "SCREEN_WIDTH": (320, 7_680),
+    "SCREEN_HEIGHT": (240, 4_320),
+}
+_FLOAT_RANGES = {
+    "bounce_min_spacing": (5.0, 200.0),
+    "map_fade_seconds": (0.0, 5.0),
+    "peg_past_fade_seconds": (0.0, 10.0),
+    "square_core_scale": (0.2, 0.75),
+    "square_core_pulse_strength": (0.0, 0.4),
+}
+
+
+def _clamped_number(value, default, minimum, maximum, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        if not isfinite(value):
+            return default
+    except OverflowError:
+        return default
+    value = max(minimum, min(maximum, value))
+    return int(round(value)) if integer else value
+
+
+def _valid_color(value, default):
+    if value == "accent":
+        return value
+    if not isinstance(value, str):
+        return default
+    try:
+        pygame.Color(value)
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
+def sanitize_settings(data: Any) -> tuple[dict[str, Any], list[str]]:
+    """Return a complete, safe settings dictionary and human-readable corrections."""
+    corrections = []
+    if not isinstance(data, dict):
+        corrections.append("settings root was not an object")
+        data = {}
+    clean = {}
+
+    for name, default in DEFAULT_SETTINGS.items():
+        value = data.get(name, default)
+        if name in _BOOLEAN_SETTINGS:
+            sanitized = value if isinstance(value, bool) else default
+        elif name in _INTEGER_RANGES:
+            sanitized = _clamped_number(value, default, *_INTEGER_RANGES[name], integer=True)
+        elif name in _FLOAT_RANGES:
+            sanitized = _clamped_number(value, default, *_FLOAT_RANGES[name])
+        elif name == "seed":
+            sanitized = value if value is None or (isinstance(value, int) and not isinstance(value, bool)) else default
+        elif name == "max_notes":
+            sanitized = value if value is None or (isinstance(value, int) and value > 0) else default
+        elif name == "theme":
+            sanitized = value if value in Config.color_themes else default
+        elif name == "square_core_shape":
+            sanitized = value if value in Config.square_core_shapes else default
+        elif name in {"square_core_color", "square_core_outline_color"}:
+            sanitized = _valid_color(value, default)
+        elif name == "shader_file_name":
+            sanitized = (
+                value if isinstance(value, str) and value.endswith(".glsl")
+                and "/" not in value and "\\" not in value else default
+            )
+        elif name == "language":
+            sanitized = value if isinstance(value, str) and value.strip() else default
+        else:
+            sanitized = value if isinstance(value, type(default)) else default
+
+        clean[name] = sanitized
+        if name in data and sanitized != value:
+            corrections.append(f"{name}: {value!r} -> {sanitized!r}")
+
+    for unknown in sorted(set(data) - set(DEFAULT_SETTINGS)):
+        corrections.append(f"ignored unknown setting: {unknown}")
+    return clean, corrections
+
+
 def get_colors():
     return Config.color_themes.get(Config.theme, Config.color_themes["dark"])
 
 
-def save_to_file(dat: Optional[dict[str, Any]] = None):
+def save_to_file(dat: Optional[dict[str, Any]] = None, path: str = "./assets/settings.json"):
     if dat is None:
         dat = {k: getattr(Config, k) for k in Config.save_attrs}
-    with open("./assets/settings.json", "w") as f:
+    with open(path, "w") as f:
         dump(dat, f, indent=4)
 
 
-def load_from_file():
+def load_from_file(path: str = "./assets/settings.json"):
+    logger = logging.getLogger("midi_playground.settings")
+    read_failed = False
     try:
-        if isfile("./assets/settings.json"):
-            with open("./assets/settings.json", "r") as f:
+        if isfile(path):
+            with open(path, "r") as f:
                 data = load(f)
-                for setting in data:
-                    setattr(Config, setting, data[setting])
         else:
-            with open("./assets/settings.json", "w") as f:
-                f.write('{}')
+            data = {}
     except Exception as e:
-        print(f"Error: {e}")
+        logger.exception("Unable to read settings; defaults restored: %s", e)
+        data = {}
+        read_failed = True
+
+    clean, corrections = sanitize_settings(data)
+    if read_failed:
+        corrections.insert(0, "settings file was unreadable; defaults restored")
+    for setting, value in clean.items():
+        setattr(Config, setting, value)
+    if corrections:
+        logger.warning("Corrected settings: %s", "; ".join(corrections))
+    if corrections or read_failed or not isfile(path):
+        try:
+            save_to_file(clean, path)
+        except OSError:
+            logger.exception("Unable to save corrected settings")
+    return corrections
 
 
 if __name__ == "config":

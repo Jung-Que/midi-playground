@@ -1,6 +1,7 @@
 import pygame
 
 from config import Config, get_colors, save_to_file
+from square import Square
 from utils import CameraFollow, get_camera_follow, get_font
 
 
@@ -15,6 +16,13 @@ class LiveConfigOverlay:
         ("Colored pegs", "do_color_bounce_pegs"),
         ("Square glow", "square_glow"),
         ("Glow intensity", "glow_intensity"),
+        ("Core shape", "square_core_shape"),
+        ("Core fill", "square_core_color"),
+        ("Core outline", "square_core_outline_color"),
+        ("Core size", "square_core_scale"),
+        ("Core outline width", "square_core_outline_width"),
+        ("Core rotation", "square_core_rotation_speed"),
+        ("Core bounce pulse", "square_core_pulse_strength"),
         ("Particle amount", "particle_amount"),
         ("Camera mode", "camera_mode"),
         ("Music volume", "volume"),
@@ -33,6 +41,7 @@ class LiveConfigOverlay:
     def __init__(self):
         self.active = False
         self.selected = 0
+        self.preview_square = Square(0, 0, 1, 1)
 
     def handle_event(self, event: pygame.event.Event, game) -> bool:
         if event.type != pygame.KEYDOWN:
@@ -76,6 +85,32 @@ class LiveConfigOverlay:
             setattr(Config, name, not bool(getattr(Config, name)))
         elif name == "glow_intensity":
             Config.glow_intensity = max(1, min(40, int(Config.glow_intensity) + direction))
+        elif name == "square_core_shape":
+            shapes = Config.square_core_shapes
+            current = Config.square_core_shape if Config.square_core_shape in shapes else shapes[0]
+            Config.square_core_shape = shapes[(shapes.index(current) + direction) % len(shapes)]
+        elif name in {"square_core_color", "square_core_outline_color"}:
+            colors = Config.square_core_colors
+            current = getattr(Config, name)
+            if current not in colors:
+                current = colors[0]
+            setattr(Config, name, colors[(colors.index(current) + direction) % len(colors)])
+        elif name == "square_core_scale":
+            Config.square_core_scale = max(
+                0.2, min(0.75, round(float(Config.square_core_scale) + direction * 0.05, 2))
+            )
+        elif name == "square_core_outline_width":
+            Config.square_core_outline_width = max(
+                0, min(6, int(Config.square_core_outline_width) + direction)
+            )
+        elif name == "square_core_rotation_speed":
+            Config.square_core_rotation_speed = max(
+                -180, min(180, int(Config.square_core_rotation_speed) + direction * 15)
+            )
+        elif name == "square_core_pulse_strength":
+            Config.square_core_pulse_strength = max(
+                0.0, min(0.4, round(float(Config.square_core_pulse_strength) + direction * 0.05, 2))
+            )
         elif name == "particle_amount":
             Config.particle_amount = max(0, min(50, int(Config.particle_amount) + direction))
         elif name == "camera_mode":
@@ -122,6 +157,18 @@ class LiveConfigOverlay:
             return get_camera_follow(value).name
         if name == "volume":
             return f"{value}%"
+        if name == "square_core_shape":
+            return str(value).replace("_", " ").title()
+        if name in {"square_core_color", "square_core_outline_color"}:
+            return "Accent" if value == "accent" else str(value).upper()
+        if name == "square_core_scale":
+            return f"{float(value) * 100:.0f}%"
+        if name == "square_core_outline_width":
+            return f"{int(value)}px"
+        if name == "square_core_rotation_speed":
+            return f"{int(value)} deg/s"
+        if name == "square_core_pulse_strength":
+            return f"{float(value) * 100:.0f}%"
         if name == "map_retention_seconds":
             return f"{value}s"
         if name == "map_fade_seconds":
@@ -160,6 +207,13 @@ class LiveConfigOverlay:
         panel.blit(title, (24, 18))
         help_text = get_font(16).render("Up/Down select  Left/Right change  F10/Esc close", True, (190, 195, 205))
         panel.blit(help_text, (24, 58))
+
+        preview_rect = pygame.Rect(width - 84, 10, 64, 64)
+        pygame.draw.rect(panel, (25, 29, 38), preview_rect, border_radius=8)
+        pygame.draw.rect(panel, (95, 105, 125), preview_rect, width=1, border_radius=8)
+        if pygame.time.get_ticks() - self.preview_square.time_since_glow_start > 1200:
+            self.preview_square.start_bounce()
+        self.preview_square.draw(panel, preview_rect.inflate(-12, -12))
 
         row_height = 28
         visible_rows = max(1, (height - 104) // row_height)

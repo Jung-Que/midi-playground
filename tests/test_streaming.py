@@ -1,6 +1,10 @@
 import os
 import random
+from collections import deque
 from io import BytesIO
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
@@ -12,8 +16,9 @@ import pygame
 
 import game as game_module
 from audioclock import AudioClock
+from bounce import Bounce
 from camera import Camera
-from config import Config
+from config import Config, load_from_file, sanitize_settings
 from configpage import CAMERA_MODE_LABELS, ConfigPage
 from game import Game
 from liveconfig import LiveConfigOverlay
@@ -31,6 +36,7 @@ from streaming import (
     song_to_spec,
 )
 from utils import CameraFollow, get_camera_follow
+from world import World
 
 
 class StreamingTests(unittest.TestCase):
@@ -42,6 +48,44 @@ class StreamingTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pygame.quit()
+
+    def test_invalid_settings_are_clamped_and_unknown_keys_are_ignored(self):
+        clean, corrections = sanitize_settings({
+            "square_speed": 99_999,
+            "volume": "loud",
+            "camera_mode": 999,
+            "square_core_shape": "triangle",
+            "square_core_color": "not-a-color",
+            "performance_hud": "yes",
+            "unexpected": "ignored",
+        })
+
+        self.assertEqual(clean["square_speed"], 2_000)
+        self.assertEqual(clean["volume"], 70)
+        self.assertEqual(clean["camera_mode"], 4)
+        self.assertEqual(clean["square_core_shape"], "diamond")
+        self.assertEqual(clean["square_core_color"], "accent")
+        self.assertTrue(clean["performance_hud"])
+        self.assertNotIn("unexpected", clean)
+        self.assertGreaterEqual(len(corrections), 7)
+
+    def test_malformed_settings_file_is_replaced_with_valid_defaults(self):
+        previous = {name: getattr(Config, name) for name in Config.save_attrs}
+        try:
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "settings.json"
+                path.write_text("{broken", encoding="utf-8")
+
+                with self.assertLogs("midi_playground.settings", level="WARNING"):
+                    corrections = load_from_file(str(path))
+                normalized = json.loads(path.read_text(encoding="utf-8"))
+
+                self.assertIn("defaults restored", corrections[0])
+                self.assertEqual(normalized["square_speed"], 600)
+                self.assertEqual(normalized["square_core_shape"], "diamond")
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
 
     def test_prepares_serializable_map(self):
         previous_max_notes = Config.max_notes
@@ -939,6 +983,100 @@ class StreamingTests(unittest.TestCase):
             Config.max_notes = previous_max_notes
             Config.square_speed = previous_speed
 
+    def test_square_motion_uses_bounce_timeline_instead_of_frame_delta(self):
+        previous_speed = Config.square_speed
+        previous_dt = Config.dt
+        Config.square_speed = 600
+        Config.dt = 4.0
+        world = World()
+        world.square = Square(0.0, 0.0, 1, 1)
+        first = Bounce([600.0, 600.0], [-1, 1], 1.0, 0)
+        second = Bounce([0.0, 1200.0], [-1, -1], 2.0, 1)
+        world.future_bounces = deque([first, second])
+        world.map_stream_complete = True
+        world.reset_motion_anchor(world.square, 0.0)
+
+        try:
+            world.time = 0.5
+            world.handle_bouncing(world.square)
+            world.sync_square_to_schedule(world.square, world.time)
+            self.assertEqual(world.square.pos, [300.0, 300.0])
+
+            world.time = 1.25
+            world.handle_bouncing(world.square)
+            world.sync_square_to_schedule(world.square, world.time)
+            self.assertEqual(world.square.pos, [450.0, 750.0])
+            self.assertEqual(world.square.dir, [-1, 1])
+        finally:
+            Config.square_speed = previous_speed
+            Config.dt = previous_dt
+
+    def test_motion_is_clamped_at_next_wall_until_bounce_is_processed(self):
+        previous_speed = Config.square_speed
+        Config.square_speed = 600
+        world = World()
+        world.square = Square(0.0, 0.0, 1, 1)
+        wall = Bounce([600.0, 600.0], [-1, 1], 1.0, 0)
+        world.future_bounces = deque([wall])
+        world.map_stream_complete = False
+        world.reset_motion_anchor(world.square, 0.0)
+
+        try:
+            world.sync_square_to_schedule(world.square, 10.0)
+            self.assertEqual(world.square.pos, [600.0, 600.0])
+        finally:
+            Config.square_speed = previous_speed
+
+    def test_thirty_minute_virtual_playback_has_no_wall_drift_or_unbounded_history(self):
+        previous_speed = Config.square_speed
+        previous_offset = Config.music_offset
+        Config.square_speed = 600
+        Config.music_offset = 0
+        interval = 0.25
+        duration = 30 * 60
+        position = [0.0, 0.0]
+        direction = [1, 1]
+        bounces = []
+        for index in range(1, int(duration / interval) + 1):
+            timestamp = index * interval
+            position = [
+                position[axis] + direction[axis] * Config.square_speed * interval
+                for axis in range(2)
+            ]
+            bounce_axis = index % 2
+            direction = direction.copy()
+            direction[bounce_axis] *= -1
+            bounces.append(Bounce(position, direction, timestamp, bounce_axis))
+
+        world = World()
+        world.square = Square(0.0, 0.0, 1, 1)
+        world.future_bounces = deque(bounces)
+        world.total_bounces = len(bounces)
+        world.map_stream_complete = True
+        world.reset_motion_anchor(world.square, 0.0)
+
+        try:
+            for target in bounces:
+                world.time = target.time - 0.001
+                world.handle_bouncing(world.square)
+                world.sync_square_to_schedule(world.square, world.time)
+                self.assertLessEqual(
+                    max(abs(world.square.pos[axis] - target.square_pos[axis]) for axis in range(2)),
+                    Config.square_speed * 0.001 + 0.0001,
+                )
+
+                world.time = target.time
+                world.handle_bouncing(world.square)
+                world.sync_square_to_schedule(world.square, world.time)
+                self.assertEqual(world.square.pos, target.square_pos)
+                world.prune_past_bounces(5.0)
+
+            self.assertEqual(world.completed_bounces, len(bounces))
+            self.assertLessEqual(len(world.past_bounces), int(5 / interval) + 1)
+        finally:
+            Config.square_speed = previous_speed
+            Config.music_offset = previous_offset
+
     def test_live_overlay_opens_and_renders_during_gameplay(self):
         game = Game()
         overlay = LiveConfigOverlay()
@@ -956,6 +1094,71 @@ class StreamingTests(unittest.TestCase):
             overlay.draw(screen, game_active=True)
         finally:
             game.shutdown()
+
+    def test_square_core_shapes_render_without_changing_hitbox(self):
+        previous = {
+            "theme": Config.theme,
+            "square_glow": Config.square_glow,
+            "square_core_shape": Config.square_core_shape,
+            "square_core_color": Config.square_core_color,
+            "square_core_outline_color": Config.square_core_outline_color,
+            "square_core_scale": Config.square_core_scale,
+            "square_core_outline_width": Config.square_core_outline_width,
+            "square_core_rotation_speed": Config.square_core_rotation_speed,
+            "square_core_pulse_strength": Config.square_core_pulse_strength,
+        }
+        Config.theme = "dark"
+        Config.square_glow = False
+        Config.square_core_color = "#FF00FF"
+        Config.square_core_outline_color = "#FF00FF"
+        Config.square_core_scale = 0.5
+        Config.square_core_outline_width = 2
+        Config.square_core_rotation_speed = 0
+        Config.square_core_pulse_strength = 0
+        square = Square(100, 100, 1, 1)
+        original_hitbox = square.rect.copy()
+
+        try:
+            for shape in Config.square_core_shapes:
+                Config.square_core_shape = shape
+                surface = pygame.Surface((200, 200), pygame.SRCALPHA)
+                square.draw(surface, pygame.Rect(75, 75, 50, 50))
+                magenta = pygame.mask.from_threshold(
+                    surface,
+                    pygame.Color("#FF00FF"),
+                    pygame.Color(1, 1, 1, 255),
+                ).count()
+                if shape == "none":
+                    self.assertEqual(magenta, 0)
+                else:
+                    self.assertGreater(magenta, 0, shape)
+                self.assertEqual(square.rect, original_hitbox)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_live_overlay_changes_and_persists_core_customization(self):
+        names = (
+            "square_core_shape",
+            "square_core_color",
+            "square_core_outline_color",
+            "square_core_scale",
+            "square_core_outline_width",
+            "square_core_rotation_speed",
+            "square_core_pulse_strength",
+        )
+        previous = {name: getattr(Config, name) for name in names}
+        game = Game()
+        try:
+            for name in names:
+                LiveConfigOverlay._adjust(name, 1, game)
+                self.assertIn(name, Config.save_attrs)
+            self.assertNotEqual(Config.square_core_shape, previous["square_core_shape"])
+            self.assertNotEqual(Config.square_core_color, previous["square_core_color"])
+        finally:
+            game.shutdown()
+            for name, value in previous.items():
+                setattr(Config, name, value)
 
     def test_live_overlay_changes_peg_readability_settings(self):
         previous_max = Config.peg_visible_max
