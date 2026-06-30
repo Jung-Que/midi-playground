@@ -5,6 +5,16 @@ from os import listdir
 import webbrowser
 
 
+CAMERA_MODE_LABELS = {
+    CameraFollow.Center: "Center",
+    CameraFollow.Lazy: "Lazy",
+    CameraFollow.Smoothed: "Smoothed",
+    CameraFollow.Predictive: "Predictive",
+    CameraFollow.TargetLead: "Target Lead (Default)",
+}
+CAMERA_LABEL_MODES = {label: mode for mode, label in CAMERA_MODE_LABELS.items()}
+
+
 class ConfigPage:
     @property
     def made_with_pgui_rect(self):
@@ -25,10 +35,12 @@ class ConfigPage:
 
         # all attributes matching /s_.+/ are "s"ettings
 
+        camera_mode = get_camera_follow(Config.camera_mode)
+        Config.camera_mode = camera_mode.value
         self.s_camera_mode = pgui.elements.UIDropDownMenu(
-            ["Center", "Lazy", "Smoothed (Default)", "Predictive"],
+            list(CAMERA_MODE_LABELS.values()),
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH // 10, Config.SCREEN_HEIGHT // 10, 300, 30)),
-            starting_option=["Center", "Lazy", "Smoothed (Default)", "Predictive"][Config.camera_mode],
+            starting_option=CAMERA_MODE_LABELS[camera_mode],
             manager=self.ui_manager
         )
         self.s_camera_mode_label = pgui.elements.UILabel(
@@ -222,7 +234,7 @@ class ConfigPage:
         )
         self.s_resolution = pgui.elements.UIDropDownMenu(
             [str(Config.rSCREEN_WIDTH) + "x" + str(Config.rSCREEN_HEIGHT), "800x600", "1024x768", "1280x720",
-             "1920x1080"],
+             "1920x1080", "540x960", "720x1280", "1080x1920"],
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH * 5 / 10, Config.SCREEN_HEIGHT * 8 // 10, 300, 30)),
             starting_option=str(Config.SCREEN_WIDTH) + "x" + str(Config.SCREEN_HEIGHT),
             manager=self.ui_manager
@@ -272,10 +284,11 @@ class ConfigPage:
                 Config.seed = None
                 self.s_seed.set_text("")
 
-                Config.camera_mode = 2
-                self.s_camera_mode.selected_option = "Smoothed (Default)"
+                Config.camera_mode = CameraFollow.TargetLead.value
+                camera_label = CAMERA_MODE_LABELS[CameraFollow.TargetLead]
+                self.s_camera_mode.selected_option = camera_label
                 self.s_camera_mode.current_state.finish()
-                self.s_camera_mode.current_state.selected_option = "Smoothed (Default)"
+                self.s_camera_mode.current_state.selected_option = camera_label
                 self.s_camera_mode.current_state.start()
 
                 Config.start_playing_delay = 3000
@@ -335,6 +348,23 @@ class ConfigPage:
                 self.s_do_particles_on_bounce.current_state.selected_option = "On"
                 self.s_do_particles_on_bounce.current_state.start()
 
+                Config.square_core_shape = "diamond"
+                Config.square_core_color = "accent"
+                Config.square_core_outline_color = "#FFFFFF"
+                Config.square_core_scale = 0.42
+                Config.square_core_outline_width = 2
+                Config.square_core_rotation_speed = 0
+                Config.square_core_pulse_strength = 0.15
+                Config.square_core_image_path = ""
+
+                Config.shorts_mode = False
+                Config.shorts_clean_ui = True
+                Config.shorts_segment_start = 0
+                Config.shorts_segment_duration = 30
+                Config.shorts_loop = True
+                Config.shorts_countdown = True
+                Config.shorts_title_overlay = True
+
                 Config.SCREEN_WIDTH = Config.rSCREEN_WIDTH
                 Config.SCREEN_HEIGHT = Config.rSCREEN_HEIGHT
 
@@ -343,7 +373,7 @@ class ConfigPage:
         if event.type == pgui.UI_DROP_DOWN_MENU_CHANGED:
             play_sound("wood.wav")
             if event.ui_element == self.s_camera_mode:
-                Config.camera_mode = "CLSP".index(event.text[0])
+                Config.camera_mode = CAMERA_LABEL_MODES[event.text].value
             if event.ui_element == self.s_color_theme:
                 Config.theme = event.text
             if event.ui_element == self.s_theatre_mode:
@@ -359,6 +389,8 @@ class ConfigPage:
             if event.ui_element == self.s_resolution:
                 event.text = event.text.split("x")
                 Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT = int(event.text[0]), int(event.text[1])
+                if Config.SCREEN_HEIGHT > Config.SCREEN_WIDTH:
+                    Config.shorts_mode = True
 
         if event.type == pgui.UI_TEXT_ENTRY_CHANGED:
             if event.ui_element == self.s_seed:

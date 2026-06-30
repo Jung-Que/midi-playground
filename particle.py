@@ -1,4 +1,5 @@
 import random
+from math import exp
 from utils import *
 import pygame
 
@@ -7,25 +8,49 @@ class Particle:
     SPEED_VARIATION = 4
     SIZE_MIN = 7
     SIZE_MAX = 14
-    AGE_RATE = 20
-    SLOW_DOWN_RATE = 1.2
+    DRAG = 5.0
 
-    def __init__(self, pos: list[float], delta: list[float], invert_color: bool = False):
+    def __init__(
+            self,
+            pos: list[float],
+            delta: list[float],
+            invert_color: bool = False,
+            *,
+            color=None,
+            lifetime: float = 0.25,
+            size_range: tuple[int, int] = None,
+            speed_scale: float = 1.0,
+    ):
         self.pos = pos.copy()
-        self.size = random.randint(Particle.SIZE_MIN, Particle.SIZE_MAX)
-        self.delta = delta.copy()
-        self.delta[0] += random.randint(-Particle.SPEED_VARIATION, Particle.SPEED_VARIATION)/8
-        self.delta[1] += random.randint(-Particle.SPEED_VARIATION, Particle.SPEED_VARIATION)/8
-        # color is hallway color if invert_color is false, else it's background color
-        self.color = get_colors()["hallway"] if not invert_color else get_colors()["background"]
+        size_min, size_max = size_range or (Particle.SIZE_MIN, Particle.SIZE_MAX)
+        self.initial_size = float(random.randint(size_min, size_max))
+        self.size = self.initial_size
+        jitter_x = random.randint(-Particle.SPEED_VARIATION, Particle.SPEED_VARIATION) / 8
+        jitter_y = random.randint(-Particle.SPEED_VARIATION, Particle.SPEED_VARIATION) / 8
+        speed = Config.PARTICLE_SPEED * FRAMERATE * float(speed_scale)
+        self.velocity = [
+            (delta[0] + jitter_x) * speed,
+            (delta[1] + jitter_y) * speed,
+        ]
+        self.lifetime = max(float(lifetime), 0.001)
+        self.elapsed = 0.0
+        default_color = get_colors()["hallway"] if not invert_color else get_colors()["background"]
+        self.color = pygame.Color(color or default_color)
+        self.alpha = 255
 
     def age(self):
-        self.size -= Particle.AGE_RATE*Config.dt
-        self.x += self.delta[0] * Config.PARTICLE_SPEED
-        self.y += self.delta[1] * Config.PARTICLE_SPEED
-        self.delta[0] /= (Particle.SLOW_DOWN_RATE+FRAMERATE) * Config.dt
-        self.delta[1] /= (Particle.SLOW_DOWN_RATE+FRAMERATE) * Config.dt
-        return self.size <= 0
+        dt = max(0.0, min(float(Config.dt), 0.1))
+        self.elapsed += dt
+        damping = exp(-Particle.DRAG * dt)
+        travel_factor = (1.0 - damping) / Particle.DRAG
+        self.x += self.velocity[0] * travel_factor
+        self.y += self.velocity[1] * travel_factor
+        self.velocity[0] *= damping
+        self.velocity[1] *= damping
+        progress = min(self.elapsed / self.lifetime, 1.0)
+        self.size = max(0.0, self.initial_size * (1.0 - progress))
+        self.alpha = int(255 * (1.0 - progress) ** 2)
+        return progress >= 1.0
 
     @property
     def x(self):

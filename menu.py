@@ -12,8 +12,8 @@ def draw_beveled_rectangle(surf: pygame.Surface, color: pygame.Color, rect: pyga
 
 
 class MenuOption:
-    HEIGHT = (Config.SCREEN_HEIGHT//9)-2
     SPACING = 16
+    HEIGHT = max(56, min((Config.SCREEN_HEIGHT - 300) // 7 - SPACING, (Config.SCREEN_HEIGHT // 9) - 2))
 
     def __init__(self, id_: str, color: pygame.Color):
         self.id = id_
@@ -56,6 +56,8 @@ class Menu:
     def __init__(self):
         self.menu_options: list[MenuOption] = [
             MenuOption("play", pygame.Color(214, 247, 163)),
+            MenuOption("import-song", pygame.Color(205, 238, 174)),
+            MenuOption("customize-square", pygame.Color(199, 246, 180)),
             MenuOption("config", pygame.Color(196, 255, 178)),
             MenuOption("contribute", pygame.Color(183, 227, 204)),
             MenuOption("open-songs-folder", pygame.Color(125, 130, 184)),
@@ -73,6 +75,7 @@ class Menu:
         self.active = True
         self.square = Square(100, 320)
         self.particles: list[Particle] = []
+        self.trail_elapsed = 0.0
 
         self.left_lang_rect: Optional[pygame.Rect] = None
         self.right_lang_rect: Optional[pygame.Rect] = None
@@ -116,12 +119,18 @@ class Menu:
 
             # particle trail
             if Config.particle_trail:
-                # every 2 frames add a particle
-                if n_frames % 2 == 0:
-                    new = Particle(self.square.pos, [0, 0], True)
-                    new.color = get_colors()["background"]
-                    new.delta = [randint(-10, 10)/20, randint(-10, 10)/20]
-                    self.particles.append(new)
+                self.trail_elapsed += max(0.0, min(float(Config.dt), 0.1))
+                interval = 1 / max(float(Config.square_afterimage_rate), 1.0)
+                if self.trail_elapsed >= interval and len(self.particles) < Config.particle_max_active:
+                    self.trail_elapsed %= interval
+                    self.particles.append(Particle(
+                        self.square.pos,
+                        [randint(-10, 10) / 20, randint(-10, 10) / 20],
+                        color=get_colors()["background"],
+                        lifetime=Config.square_afterimage_seconds,
+                        size_range=(3, 7),
+                        speed_scale=0.25,
+                    ))
 
             # particles
             for particle in self.particles:
@@ -137,8 +146,16 @@ class Menu:
                 sd[latest_dir] *= -1
                 sd[1-latest_dir] = 0
                 sp = self.square.pos
-                for _ in range(Config.particle_amount):
-                    new = Particle([sp[0]+randint(-10, 10), sp[1]+randint(-10, 10)], sd)
+                remaining = max(int(Config.particle_max_active) - len(self.particles), 0)
+                for _ in range(min(int(Config.particle_amount), remaining)):
+                    new = Particle(
+                        [sp[0] + randint(-10, 10), sp[1] + randint(-10, 10)],
+                        sd,
+                        color=self.square.accent_color(),
+                        lifetime=Config.particle_bounce_lifetime,
+                        size_range=(3, 8),
+                        speed_scale=0.75,
+                    )
                     self.particles.append(new)
 
         # title text

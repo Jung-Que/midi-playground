@@ -7,6 +7,8 @@ TRANSLATIONS = {
         "font-menu-shadow-offset": 9,
         "font-menu-shadow-length-offset": 0,
         "play": "Play",
+        "import-song": "Import Local Song",
+        "customize-square": "Customize Square",
         "config": "Config",
         "contribute": "Contribute",
         "open-songs-folder": "Open Songs Folder",

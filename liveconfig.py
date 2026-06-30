@@ -1,7 +1,8 @@
 import pygame
 
 from config import Config, get_colors, save_to_file
-from utils import CameraFollow, get_font
+from square import Square
+from utils import CameraFollow, get_camera_follow, get_font
 
 
 class LiveConfigOverlay:
@@ -15,10 +16,30 @@ class LiveConfigOverlay:
         ("Colored pegs", "do_color_bounce_pegs"),
         ("Square glow", "square_glow"),
         ("Glow intensity", "glow_intensity"),
+        ("Core shape", "square_core_shape"),
+        ("Core fill", "square_core_color"),
+        ("Core outline", "square_core_outline_color"),
+        ("Core size", "square_core_scale"),
+        ("Core outline width", "square_core_outline_width"),
+        ("Core rotation", "square_core_rotation_speed"),
+        ("Core bounce pulse", "square_core_pulse_strength"),
         ("Particle amount", "particle_amount"),
         ("Camera mode", "camera_mode"),
         ("Music volume", "volume"),
+        ("Shorts mode (next song)", "shorts_mode"),
+        ("Clean recording UI", "shorts_clean_ui"),
+        ("Segment start", "shorts_segment_start"),
+        ("Segment length", "shorts_segment_duration"),
+        ("Repeat segment", "shorts_loop"),
+        ("Title overlay", "shorts_title_overlay"),
+        ("Recording countdown", "shorts_countdown"),
         ("Map retention", "map_retention_seconds"),
+        ("Map reveal fade", "map_fade_seconds"),
+        ("Visible peg cap", "peg_visible_max"),
+        ("Past peg fade", "peg_past_fade_seconds"),
+        ("Peg visual spacing", "peg_overlap_padding"),
+        ("Next peg guide", "peg_guide_line"),
+        ("Performance HUD", "performance_hud"),
         ("Square speed (future)", "square_speed"),
         ("Bounce spacing (future)", "bounce_min_spacing"),
         ("Direction change (future)", "direction_change_chance"),
@@ -27,6 +48,7 @@ class LiveConfigOverlay:
     def __init__(self):
         self.active = False
         self.selected = 0
+        self.preview_square = Square(0, 0, 1, 1)
 
     def handle_event(self, event: pygame.event.Event, game) -> bool:
         if event.type != pygame.KEYDOWN:
@@ -63,13 +85,43 @@ class LiveConfigOverlay:
             themes = list(Config.color_themes)
             current_index = themes.index(Config.theme) if Config.theme in themes else 0
             Config.theme = themes[(current_index + direction) % len(themes)]
+        elif name in {"shorts_mode", "shorts_clean_ui", "shorts_loop", "shorts_title_overlay", "shorts_countdown"}:
+            setattr(Config, name, not bool(getattr(Config, name)))
+            if name == "shorts_mode" and game.active:
+                game.stream_message = "Shorts mode will apply when the next song starts"
         elif name in {
             "bounce_effect", "do_particles_on_bounce", "particle_trail",
-            "do_color_bounce_pegs", "square_glow",
+            "do_color_bounce_pegs", "square_glow", "performance_hud", "peg_guide_line",
         }:
             setattr(Config, name, not bool(getattr(Config, name)))
         elif name == "glow_intensity":
             Config.glow_intensity = max(1, min(40, int(Config.glow_intensity) + direction))
+        elif name == "square_core_shape":
+            shapes = Config.square_core_shapes
+            current = Config.square_core_shape if Config.square_core_shape in shapes else shapes[0]
+            Config.square_core_shape = shapes[(shapes.index(current) + direction) % len(shapes)]
+        elif name in {"square_core_color", "square_core_outline_color"}:
+            colors = Config.square_core_colors
+            current = getattr(Config, name)
+            if current not in colors:
+                current = colors[0]
+            setattr(Config, name, colors[(colors.index(current) + direction) % len(colors)])
+        elif name == "square_core_scale":
+            Config.square_core_scale = max(
+                0.2, min(0.75, round(float(Config.square_core_scale) + direction * 0.05, 2))
+            )
+        elif name == "square_core_outline_width":
+            Config.square_core_outline_width = max(
+                0, min(6, int(Config.square_core_outline_width) + direction)
+            )
+        elif name == "square_core_rotation_speed":
+            Config.square_core_rotation_speed = max(
+                -180, min(180, int(Config.square_core_rotation_speed) + direction * 15)
+            )
+        elif name == "square_core_pulse_strength":
+            Config.square_core_pulse_strength = max(
+                0.0, min(0.4, round(float(Config.square_core_pulse_strength) + direction * 0.05, 2))
+            )
         elif name == "particle_amount":
             Config.particle_amount = max(0, min(50, int(Config.particle_amount) + direction))
         elif name == "camera_mode":
@@ -79,8 +131,30 @@ class LiveConfigOverlay:
         elif name == "volume":
             Config.volume = max(0, min(100, int(Config.volume) + direction * 5))
             pygame.mixer.music.set_volume(Config.volume / 100)
+        elif name == "shorts_segment_start":
+            Config.shorts_segment_start = max(0, int(Config.shorts_segment_start) + direction * 5)
+            if game.active:
+                game.stream_message = "Segment start will apply when the next song starts"
+        elif name == "shorts_segment_duration":
+            durations = (15, 30, 60)
+            current = Config.shorts_segment_duration if Config.shorts_segment_duration in durations else 30
+            Config.shorts_segment_duration = durations[(durations.index(current) + direction) % len(durations)]
         elif name == "map_retention_seconds":
             Config.map_retention_seconds = max(1, min(30, int(Config.map_retention_seconds) + direction))
+        elif name == "map_fade_seconds":
+            Config.map_fade_seconds = max(0.0, min(2.0, round(float(Config.map_fade_seconds) + direction * 0.05, 2)))
+        elif name == "peg_visible_max":
+            Config.peg_visible_max = max(
+                int(Config.peg_visible_min), min(10, int(Config.peg_visible_max) + direction)
+            )
+        elif name == "peg_past_fade_seconds":
+            Config.peg_past_fade_seconds = max(
+                0.0, min(5.0, round(float(Config.peg_past_fade_seconds) + direction * 0.1, 1))
+            )
+        elif name == "peg_overlap_padding":
+            Config.peg_overlap_padding = max(
+                0, min(24, int(Config.peg_overlap_padding) + direction * 2)
+            )
         elif name == "square_speed":
             Config.square_speed = max(100, min(2000, int(Config.square_speed) + direction * 50))
             game.regenerate_future_map()
@@ -99,11 +173,36 @@ class LiveConfigOverlay:
         if isinstance(value, bool):
             return "On" if value else "Off"
         if name == "camera_mode":
-            return CameraFollow(int(value)).name
+            return get_camera_follow(value).name
         if name == "volume":
             return f"{value}%"
+        if name == "shorts_segment_start":
+            minutes, seconds = divmod(int(value), 60)
+            return f"{minutes}:{seconds:02d}"
+        if name == "shorts_segment_duration":
+            return f"{int(value)}s"
+        if name == "square_core_shape":
+            return str(value).replace("_", " ").title()
+        if name in {"square_core_color", "square_core_outline_color"}:
+            return "Accent" if value == "accent" else str(value).upper()
+        if name == "square_core_scale":
+            return f"{float(value) * 100:.0f}%"
+        if name == "square_core_outline_width":
+            return f"{int(value)}px"
+        if name == "square_core_rotation_speed":
+            return f"{int(value)} deg/s"
+        if name == "square_core_pulse_strength":
+            return f"{float(value) * 100:.0f}%"
         if name == "map_retention_seconds":
             return f"{value}s"
+        if name == "map_fade_seconds":
+            return f"{float(value):.2f}s"
+        if name == "peg_visible_max":
+            return str(int(value))
+        if name == "peg_past_fade_seconds":
+            return f"{float(value):.1f}s"
+        if name == "peg_overlap_padding":
+            return f"{int(value)}px"
         if name == "square_speed":
             return f"{value}px/s"
         if name == "bounce_min_spacing":
@@ -117,13 +216,14 @@ class LiveConfigOverlay:
             self.active = False
             return
 
-        hint = get_font(18).render("F10: live settings", True, (255, 255, 255))
-        screen.blit(hint, hint.get_rect(topright=(Config.SCREEN_WIDTH - 15, 15)))
+        if not (Config.shorts_mode and Config.shorts_clean_ui and not self.active):
+            hint = get_font(18).render("F10: live settings", True, (255, 255, 255))
+            screen.blit(hint, hint.get_rect(topright=(Config.SCREEN_WIDTH - 15, 15)))
         if not self.active:
             return
 
         width = min(620, Config.SCREEN_WIDTH - 40)
-        height = min(540, Config.SCREEN_HEIGHT - 40)
+        height = min(600, Config.SCREEN_HEIGHT - 40)
         panel = pygame.Surface((width, height), pygame.SRCALPHA)
         panel.fill((10, 12, 18, 225))
         pygame.draw.rect(panel, get_colors()["hallway"], panel.get_rect(), width=3, border_radius=8)
@@ -133,11 +233,22 @@ class LiveConfigOverlay:
         help_text = get_font(16).render("Up/Down select  Left/Right change  F10/Esc close", True, (190, 195, 205))
         panel.blit(help_text, (24, 58))
 
-        row_height = 30
-        for index, (label, name) in enumerate(self.OPTIONS):
-            y = 94 + index * row_height
-            if y + row_height > height - 10:
-                break
+        preview_rect = pygame.Rect(width - 84, 10, 64, 64)
+        pygame.draw.rect(panel, (25, 29, 38), preview_rect, border_radius=8)
+        pygame.draw.rect(panel, (95, 105, 125), preview_rect, width=1, border_radius=8)
+        if pygame.time.get_ticks() - self.preview_square.time_since_glow_start > 1200:
+            self.preview_square.start_bounce()
+        self.preview_square.draw(panel, preview_rect.inflate(-12, -12))
+
+        row_height = 28
+        visible_rows = max(1, (height - 104) // row_height)
+        start = max(0, min(
+            self.selected - visible_rows // 2,
+            len(self.OPTIONS) - visible_rows,
+        ))
+        for display_index, index in enumerate(range(start, min(start + visible_rows, len(self.OPTIONS)))):
+            label, name = self.OPTIONS[index]
+            y = 94 + display_index * row_height
             if index == self.selected:
                 pygame.draw.rect(panel, (60, 75, 95, 220), (14, y - 3, width - 28, 28), border_radius=5)
             color = (255, 255, 255) if index == self.selected else (210, 214, 222)

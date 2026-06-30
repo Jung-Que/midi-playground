@@ -6,6 +6,16 @@ we have a new song format, and instead of using `<song>.mid` and `<song>-mainlin
 
 ## tutorial
 
+### built-in local importer
+
+the recommended private workflow is `Import Local Song` on the main menu. drop or select one audio file
+(`.mp3`, `.wav`, or `.ogg`) and one MIDI map (`.mid` or `.midi`), fill in the metadata, validate, and choose
+`Create local ZIP`. the tool checks corruption, note density, file size, and duplicate content before writing an
+atomic version 2 pack to `songs-local/`. that directory is ignored by git and is not included in verified builds.
+
+the source/rights field is informational. only move a generated pack to the tracked `songs/` directory when its
+redistribution rights are confirmed.
+
 each `.zip` file in the `songs` directory represents a map, and each `.zip` file has a few main components.
 
 if you are not sure how to create or extract zip files, you should learn how to do that before porting your `.mid` files. i'm not willing to explain here, but there are probably plenty of tutorials online, or chatgpt could help you create and extract `.zip` files

@@ -27,18 +27,75 @@ install requirements with `python3 -m pip install -r requirements.txt`
 
 start program with `python3 main.py`
 
+private or rights-unverified song packs can be placed in `songs-local/`. they appear first in the song selector with
+a `[LOCAL ONLY]` label, but `songs-local/`, `imports-local/`, and `exports/` are ignored by git and omitted from the
+verified package build. only redistribution-cleared packs belong in the tracked `songs/` directory.
+
+the main menu's `Import Local Song` tool builds these packs without manual ZIP editing. select or drag one
+MP3/WAV/OGG file and one MIDI map, enter title/artist/mapper/source, preview the audio, adjust the saved timing
+offset, and validate note density before creation. SHA-256 content fingerprints prevent duplicate local or public
+packs, and successful imports appear immediately in the song selector.
+
+`Customize Square` opens a dedicated live editor for the fixed outer square's inner symbol. it includes built-in
+shape presets, colour pickers, size/outline/rotation/bounce-pulse controls, transparent custom PNG installation,
+local preset saving, and JSON import/export. custom images and presets are copied under `presets-local/`, which is
+ignored by git. invalid or missing image files fall back to the diamond symbol without changing the hitbox.
+
+invalid or outdated values in `assets/settings.json` are clamped or restored during startup. packaged Windows
+runs keep settings, local songs, and square presets under `%LOCALAPPDATA%/MidiPlayground`, separate from bundled
+public resources. source runs write
+rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
+`%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.
+
 ## continuous playback and live settings
 
-choosing a song starts a continuous playlist from that song. while the current song is playing, the next song's
-map is generated in a worker process and its audio is prepared for the mixer queue. old map geometry is removed
-after it is both behind the playback time and outside the expanded camera view.
+choosing a song starts a continuous playlist from that song. while the current song is playing, maps and audio
+for the next two songs are prepared in the background. audio is queued only after its matching map is ready. a
+slow preparation waits safely at the transition, and a broken song is skipped without stopping the playlist.
+
+maps are generated incrementally in a worker process as time chunks. chunks are transport units only: their pegs
+and safe areas enter the live world one bounce at a time and fade in briefly instead of appearing as a block. old
+records are removed individually after they leave the expanded viewport, while visible history is preserved. a
+spatial hash limits collision and viewport queries. playback timing follows the mixer position when it is reliable and falls back to a
+monotonic wall clock. the performance HUD shows FPS, python memory, active/buffered chunks, pegs, particles,
+preparation time, transition wait, and measured synchronization drift.
+initial and streamed bounces share one schedule offset so chunk boundaries cannot reorder pending collisions.
+
+map generation remains 30 seconds ahead, but rendering is density-aware: only the next three to six readable pegs
+are shown. overlapping later markers are suppressed without dropping their notes, the immediate target is outlined
+and connected by a guide line, and at most three recent pegs fade out over 1.5 seconds behind the square.
+the first three visible targets are numbered, the immediate target gets a music-timed countdown ring, and each hit
+briefly compresses its peg and emits an expanding confirmation ring. the TargetLead camera frames the square and
+next peg together with capped look-ahead and frame-rate-independent smoothing.
+
+the square uses a layered neon core with directional edge lighting and a short collision-face flash. movement trail
+particles are replaced by four time-based afterimages. bounce particles use delta-time-independent motion, directional
+theme colors, adaptive counts for dense songs, alpha fade, and a global active-particle budget. glow surfaces are
+quantized and cached instead of rebuilding the OpenCV bloom on every frame.
 
 press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
-left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, and map retention can
-be changed without stopping playback. square speed, bounce spacing, and direction chance regenerate only the
+left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, map retention, peg count,
+peg spacing, target guide, and fades can be changed without stopping playback. the square's fixed outer body can use
+diamond, heart, star, circle, note, bolt, cross, or empty inner symbols with independent fill, outline, size, rotation,
+and bounce-pulse settings. these visual options never change the square hitbox or map physics. square speed, bounce spacing, and direction chance regenerate only the
 unplayed portion of the current map, starting from the square's current state.
 
-verified build command: `pyinstaller main.py --noconsole --onedir --clean --hidden-import glcontext --add-data "assets;assets" --add-data "songs;songs"`
+shorts mode is available from the same `F10` overlay. choose a vertical resolution such as `540x960`, `720x1280`,
+or `1080x1920` on the config page and restart. shorts mode keeps the square and immediate target inside configurable
+recording-safe margins with dynamic camera zoom, can hide gameplay/debug UI, shows a recording countdown and song
+title, and plays a repeatable 15, 30, or 60 second segment from a five-second-adjustable start point. segment and
+mode changes apply when the next song starts; clean UI, title, countdown, duration, and repeat can be changed live.
+
+## verified Windows release
+
+run `python tools/build_release.py` from the repository root. the release builder runs all unit tests, copies only
+the public files allow-listed in `packaging/release-manifest.txt`, builds the Windows application, launches the
+packaged streaming/shorts/import/customizer smoke suite from outside its install directory, rejects private data,
+and writes a versioned ZIP plus SHA-256 file under `exports/releases/`.
+
+when adding a redistribution-cleared built-in song or asset, add its path to the release manifest. files under
+`songs-local/`, `imports-local/`, `presets-local/`, `exports/`, logs, and user settings are never release inputs.
+see [docs/RELEASE.md](docs/RELEASE.md) for the complete checklist.
 
 ## credits
 
