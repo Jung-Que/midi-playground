@@ -43,3 +43,19 @@ The installed application stores writable data under `%LOCALAPPDATA%/MidiPlaygro
 - Verify the SHA-256 value with `Get-FileHash -Algorithm SHA256 <zip>`.
 - Review the public song list and license/source metadata.
 - Tag the exact release commit and upload both the ZIP and `.sha256` file.
+
+## Long-session validation
+
+Run the accelerated 60-minute playback lifecycle with real bundled MP3/MIDI assets:
+
+```powershell
+python tools/soak_test.py --simulated-minutes 60
+```
+
+The report is written to `exports/soak/soak-report.json`. It covers repeated song transitions, three square-speed
+variants, trajectory continuity, audio decoding, rolling chunk cleanup, map generation latency, note density, and
+Python memory growth. This advances the map/audio timeline without waiting an hour of wall-clock time; final release
+approval should still include one manual real-time playback session on the target PC.
+
+`.github/workflows/windows-validation.yml` runs the unit suite, source smoke suite, a shorter soak, the verified
+PyInstaller build, and packaged smoke suite for every pull request and `master` push.
