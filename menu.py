@@ -56,6 +56,7 @@ class Menu:
     def __init__(self):
         self.menu_options: list[MenuOption] = [
             MenuOption("play", pygame.Color(214, 247, 163)),
+            MenuOption("import-song", pygame.Color(205, 238, 174)),
             MenuOption("config", pygame.Color(196, 255, 178)),
             MenuOption("contribute", pygame.Color(183, 227, 204)),
             MenuOption("open-songs-folder", pygame.Color(125, 130, 184)),

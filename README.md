@@ -31,6 +31,11 @@ private or rights-unverified song packs can be placed in `songs-local/`. they ap
 a `[LOCAL ONLY]` label, but `songs-local/`, `imports-local/`, and `exports/` are ignored by git and omitted from the
 verified package build. only redistribution-cleared packs belong in the tracked `songs/` directory.
 
+the main menu's `Import Local Song` tool builds these packs without manual ZIP editing. select or drag one
+MP3/WAV/OGG file and one MIDI map, enter title/artist/mapper/source, preview the audio, adjust the saved timing
+offset, and validate note density before creation. SHA-256 content fingerprints prevent duplicate local or public
+packs, and successful imports appear immediately in the song selector.
+
 invalid or outdated values in `assets/settings.json` are clamped or restored during startup. source runs write
 rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
 `%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.

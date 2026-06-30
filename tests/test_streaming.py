@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic, sleep, time
 from types import SimpleNamespace
 import unittest
+from zipfile import ZipFile
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -24,6 +25,16 @@ from game import Game
 from liveconfig import LiveConfigOverlay
 from particle import Particle
 from songselector import SongSelector, make_song_from_zip
+from songimporter import (
+    DuplicateSongError,
+    SongImportError,
+    SongImportRequest,
+    analyze_song_import,
+    create_song_pack,
+    find_duplicate_song,
+    safe_song_slug,
+)
+from songimportpage import SongImportPage
 from spatial import SpatialHash
 from square import Square
 from streaming import (
@@ -110,6 +121,82 @@ class StreamingTests(unittest.TestCase):
         song = make_song_from_zip("songs/bad-piggies.zip", local_only=True)
         self.assertTrue(song.local_only)
         self.assertEqual(SongSelector.SONG_DIRECTORIES[0], "songs-local")
+
+    def test_local_importer_analyzes_builds_and_reloads_real_song_assets(self):
+        source_song = make_song_from_zip("songs/calm_down.zip")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / Path(source_song.audio_file_name).name
+            midi_path = root / Path(source_song.song_file_name).name
+            with ZipFile(source_song.fp) as archive:
+                audio_path.write_bytes(archive.read(source_song.audio_file_name))
+                midi_path.write_bytes(archive.read(source_song.song_file_name))
+            request = SongImportRequest(
+                audio_path=audio_path,
+                midi_path=midi_path,
+                title="Importer Test",
+                artist="Test Artist",
+                mapper="Test Mapper",
+                source="Local validation",
+                music_offset=125,
+            )
+
+            analysis = analyze_song_import(request, Config.bounce_min_spacing)
+            self.assertGreater(analysis.note_count, 0)
+            self.assertGreater(analysis.playable_note_count, 0)
+            self.assertGreater(analysis.audio_bytes, 1024)
+
+            output = root / "songs-local"
+            result = create_song_pack(
+                request,
+                output_directory=output,
+                bounce_spacing_ms=Config.bounce_min_spacing,
+                duplicate_directories=(output,),
+            )
+            imported = make_song_from_zip(str(result.output_path), local_only=True)
+            self.assertEqual(imported.name, "Importer Test")
+            self.assertEqual(imported.song_artist, "Test Artist")
+            self.assertEqual(imported.music_offset, 125)
+            self.assertTrue(imported.local_only)
+            self.assertEqual(find_duplicate_song(analysis.fingerprint, (output,)), result.output_path)
+            with self.assertRaises(DuplicateSongError):
+                create_song_pack(request, output, duplicate_directories=(output,))
+
+    def test_local_importer_rejects_corrupt_and_incomplete_inputs(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio_path = root / "broken.mp3"
+            midi_path = root / "broken.mid"
+            audio_path.write_bytes(b"not an mp3")
+            midi_path.write_bytes(b"not a midi")
+            request = SongImportRequest(audio_path, midi_path, "Broken", "Artist", "Mapper")
+            with self.assertRaises(SongImportError):
+                analyze_song_import(request)
+
+            missing_title = SongImportRequest(audio_path, midi_path, "", "Artist", "Mapper")
+            with self.assertRaisesRegex(SongImportError, "title"):
+                create_song_pack(missing_title, root / "output", duplicate_directories=(root / "output",))
+
+    def test_local_importer_uses_fingerprint_slug_for_non_latin_titles(self):
+        self.assertEqual(safe_song_slug("피아노 곡", "abcdef123456"), "song-abcdef12")
+
+    def test_import_page_accepts_dragged_audio_and_midi_files(self):
+        previous_width = Config.SCREEN_WIDTH
+        previous_height = Config.SCREEN_HEIGHT
+        Config.SCREEN_WIDTH = 800
+        Config.SCREEN_HEIGHT = 600
+        page = SongImportPage()
+        page.active = True
+        try:
+            page.handle_event(pygame.event.Event(pygame.DROPFILE, file="C:/music/example.mp3"))
+            page.handle_event(pygame.event.Event(pygame.DROPFILE, file="C:/music/example.mid"))
+            self.assertTrue(page.audio_entry.get_text().endswith("example.mp3"))
+            self.assertTrue(page.midi_entry.get_text().endswith("example.mid"))
+            self.assertEqual(page.title_entry.get_text(), "Example")
+            page.draw(pygame.display.get_surface())
+        finally:
+            Config.SCREEN_WIDTH = previous_width
+            Config.SCREEN_HEIGHT = previous_height
 
     def test_prunes_only_old_offscreen_geometry(self):
         previous_retention = Config.map_retention_seconds

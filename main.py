@@ -7,6 +7,7 @@ from menu import Menu
 from game import Game
 from configpage import ConfigPage
 from songselector import SongSelector, make_song_from_zip
+from songimportpage import SongImportPage
 from errorscreen import ErrorScreen
 from liveconfig import LiveConfigOverlay
 from os import chdir, getcwd
@@ -109,6 +110,42 @@ def run_shorts_smoke_test() -> int:
         pygame.quit()
 
 
+def run_import_smoke_test() -> int:
+    """Build and reload a local song pack entirely inside a temporary directory."""
+    set_resource_root()
+    from tempfile import TemporaryDirectory
+    from zipfile import ZipFile
+    from songimporter import DuplicateSongError, SongImportRequest, create_song_pack
+
+    source = make_song_from_zip("songs/calm_down.zip")
+    with TemporaryDirectory() as directory:
+        root = Path(directory)
+        audio_path = root / Path(source.audio_file_name).name
+        midi_path = root / Path(source.song_file_name).name
+        with ZipFile(source.fp) as archive:
+            audio_path.write_bytes(archive.read(source.audio_file_name))
+            midi_path.write_bytes(archive.read(source.song_file_name))
+        output = root / "songs-local"
+        request = SongImportRequest(
+            audio_path,
+            midi_path,
+            "Packaged Import Test",
+            "Test Artist",
+            "Test Mapper",
+            "Temporary smoke test",
+            125,
+        )
+        result = create_song_pack(request, output, duplicate_directories=(output,))
+        imported = make_song_from_zip(str(result.output_path), local_only=True)
+        if imported.name != request.title or imported.music_offset != 125 or not imported.local_only:
+            raise RuntimeError("Generated local song pack did not reload correctly")
+        try:
+            create_song_pack(request, output, duplicate_directories=(output,))
+        except DuplicateSongError:
+            return 0
+        raise RuntimeError("Duplicate local song was not rejected")
+
+
 def main():
     set_resource_root()
 
@@ -195,6 +232,7 @@ def main():
     error_screen = ErrorScreen()
     game = Game()
     live_config = LiveConfigOverlay()
+    song_import_page = SongImportPage()
 
     # game loop
     running = True
@@ -252,6 +290,11 @@ def main():
                         config_page.active = False
                         menu.active = True
                         continue
+                    if song_import_page.active:
+                        song_import_page.active = False
+                        song_import_page.stop_preview(resume_menu=True)
+                        menu.active = True
+                        continue
                     if error_screen.active:
                         error_screen.active = False
                         song_selector.active = True
@@ -270,11 +313,22 @@ def main():
                 menu.active = False
                 if option_id == "config":
                     config_page.active = True
+                if option_id == "import-song":
+                    song_import_page.active = True
                 if option_id == "play":
                     song_selector.active = True
                     song_selector.reload_songs()
                 if option_id == "quit":
                     running = False
+                continue
+
+            import_result = song_import_page.handle_event(event)
+            if import_result == "back":
+                song_import_page.active = False
+                menu.active = True
+                continue
+            if isinstance(import_result, tuple) and import_result[0] == "created":
+                song_selector.reload_songs()
                 continue
 
             # handle song selector events
@@ -321,6 +375,7 @@ def main():
         config_page.draw(screen)
         menu.draw(screen, n_frames)
         error_screen.draw(screen)
+        song_import_page.draw(screen)
         live_config.draw(screen, game.active)
 
         update_screen(screen, glsl_program, render_object)
@@ -338,4 +393,6 @@ if __name__ == '__main__':
         raise SystemExit(run_stream_smoke_test())
     if "--shorts-smoke-test" in sys.argv:
         raise SystemExit(run_shorts_smoke_test())
+    if "--import-smoke-test" in sys.argv:
+        raise SystemExit(run_import_smoke_test())
     main()
