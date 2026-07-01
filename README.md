@@ -1,145 +1,119 @@
-# midi playground
-bouncing square video, FOSS edition (and gamified)
+# MIDI Live Playground
 
-## NOTICES
+MIDI와 오디오를 따라 움직이는 스퀘어 영상을 **연속 재생·실시간 맵 스트리밍·음악 패키징·라이브 디자인 편집**까지 확장한 Shorts 제작 도구입니다.
 
-### for content creators:
+[![Windows validation](https://github.com/Jung-Que/midi-playground/actions/workflows/windows-validation.yml/badge.svg)](https://github.com/Jung-Que/midi-playground/actions/workflows/windows-validation.yml)
+![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![pygame-ce](https://img.shields.io/badge/pygame--ce-2.5.7-00A86B)
+![License GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue)
 
-please try to put the link to this repository in your youtube video descriptions if the youtube video features this software, that is all i request
+<p align="center">
+  <img src="docs/images/gameplay.png" width="920" alt="MIDI Live Playground gameplay">
+</p>
 
-### for developers:
+## 원작에서 달라진 점
 
-***this code is licensed under GPL3, it is illegal to publicly distribute modified copies of this software without providing the source upon request!***
+이 저장소는 [quasar098/midi-playground](https://github.com/quasar098/midi-playground)를 포크해, 한 곡을 감상하는 데모를 반복 제작에 사용할 수 있는 도구로 확장한 버전입니다.
 
-it is ok, however, to modify the code and not release the source if you are not releasing the modified version to the public.
+<table>
+  <tr>
+    <th width="50%">Original</th>
+    <th width="50%">MIDI Live Playground</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/original-menu.png" alt="Original midi-playground menu"></td>
+    <td><img src="docs/images/main-menu.png" alt="Extended MIDI Live Playground menu"></td>
+  </tr>
+  <tr>
+    <td>단일 곡 실행과 기본 설정 중심</td>
+    <td>로컬 음악 등록과 스퀘어 커스터마이저를 메인 메뉴에 통합</td>
+  </tr>
+</table>
 
-## how to do custom songs?
+| 구분 | 원작 | 확장 버전 |
+| --- | --- | --- |
+| 재생 | 곡마다 다시 선택 | 현재 곡부터 연속 재생, 다음 2곡 선행 준비 |
+| 맵 | 재생 전 전체 맵 생성 | 재생 중 시간 단위 청크 생성·적용·정리 |
+| 충돌 탐색 | 전체 객체 순회 | Spatial Hash 기반 근접 객체 탐색 |
+| 음악 등록 | ZIP 구조를 수동 편집 | MP3/WAV/OGG + MIDI 선택, 메타데이터 입력, 검증 및 패키징 |
+| 디자인 | 고정된 스퀘어 표현 | 외곽 히트박스는 유지하고 내부 심볼·색·효과를 실시간 변경 |
+| 운영 | 한 번 실행하는 데모 | 성능 HUD, 로그, 장시간 검증, Windows 패키징 파이프라인 |
 
-see [docs/SONGS.md](https://github.com/quasar098/midi-playground/blob/master/docs/SONGS.md) for custom song tutorial
+## 제작 기능
 
-## development guide
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/music-import.png" alt="Local song importer"></td>
+    <td width="50%"><img src="docs/images/square-customizer.png" alt="Square customizer"></td>
+  </tr>
+  <tr>
+    <td><strong>음악 패키징</strong><br>오디오와 MIDI를 선택하고 제목·아티스트·매퍼·출처·타이밍을 입력합니다. 형식과 노트 밀도, 중복 파일을 검사한 뒤 로컬 곡 패키지로 생성합니다.</td>
+    <td><strong>스퀘어 커스터마이징</strong><br>외곽 스퀘어의 충돌 크기는 그대로 두고 내부 심볼, 채우기·윤곽 색, 크기, 회전, 바운스 펄스를 편집하고 프리셋으로 저장합니다.</td>
+  </tr>
+</table>
 
-this is how you set up the code to run it from source, rather than a bundled pyinstaller executable
+## 핵심 기능
 
-download python from [here](https://python.org) specifically (3.9.1 should work). do not download from windows store. that version is really janky and doesn't work that well for more complex python programs with lots of dependencies
+- **끊김을 줄인 연속 재생** — 다음 2곡의 오디오와 맵을 백그라운드에서 준비하고, 준비가 늦으면 안전하게 기다리며 실패한 곡은 건너뜁니다.
+- **실시간 맵 스트리밍** — 워커 프로세스가 미래 구간을 청크로 생성하고, 게임 월드는 바운스 단위로 반영합니다. 화면 뒤 기록은 보존 구간이 지난 뒤 제거합니다.
+- **시간축 동기화** — 오디오 재생 위치와 바운스 스케줄을 기준으로 월드 시간과 스퀘어 위치를 맞추고, 아직 처리되지 않은 다음 충돌을 지나치지 않도록 제한합니다.
+- **가독성 중심의 페그 표현** — 가까운 목표만 선별해 번호·카운트다운·충돌 확인 효과를 표시하고, 지나간 페그와 이펙트는 점진적으로 정리합니다.
+- **F10 라이브 설정** — 색, 파티클, 글로우, 카메라, 볼륨, 맵 보존 범위, 페그 수와 간격, 타깃 가이드를 재생 중 변경합니다.
+- **Shorts 모드** — 세로 해상도, 안전 여백, 클린 UI, 곡 제목, 카운트다운과 15/30/60초 반복 구간을 지원합니다.
 
-install requirements with `python3 -m pip install -r requirements.txt`
+## 빠른 실행
 
-start program with `python3 main.py`
+Python 3.11 환경을 권장합니다.
 
-private or rights-unverified song packs can be placed in `songs-local/`. they appear first in the song selector with
-a `[LOCAL ONLY]` label, but `songs-local/`, `imports-local/`, and `exports/` are ignored by git and omitted from the
-verified package build. only redistribution-cleared packs belong in the tracked `songs/` directory.
+```powershell
+git clone https://github.com/Jung-Que/midi-playground.git
+cd midi-playground
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python main.py
+```
 
-the main menu's `Import Local Song` tool builds these packs without manual ZIP editing. select or drag one
-MP3/WAV/OGG file and one MIDI map, enter title/artist/mapper/source, preview the audio, adjust the saved timing
-offset, and validate note density before creation. SHA-256 content fingerprints prevent duplicate local or public
-packs, and successful imports appear immediately in the song selector.
+메인 메뉴에서 곡을 선택하면 연속 재생이 시작됩니다. 게임 중 `F10`으로 라이브 설정을 열고, 방향키로 항목과 값을 변경할 수 있습니다.
 
-`Customize Square` opens a dedicated live editor for the fixed outer square's inner symbol. it includes built-in
-shape presets, colour pickers, size/outline/rotation/bounce-pulse controls, transparent custom PNG installation,
-local preset saving, and JSON import/export. custom images and presets are copied under `presets-local/`, which is
-ignored by git. invalid or missing image files fall back to the diamond symbol without changing the hitbox.
+## 처리 구조
 
-invalid or outdated values in `assets/settings.json` are clamped or restored during startup. packaged Windows
-runs keep settings, local songs, and square presets under `%LOCALAPPDATA%/MidiPlayground`, separate from bundled
-public resources. source runs write
-rotating diagnostics to `logs/midi-playground.log`; packaged Windows runs use
-`%LOCALAPPDATA%/MidiPlayground/logs/midi-playground.log` so crashes remain diagnosable without a console.
+```mermaid
+flowchart LR
+    A[오디오 + MIDI 등록] --> B[곡 패키지 검증]
+    B --> C[현재 곡 재생]
+    C --> D[다음 2곡 선행 준비]
+    C --> E[미래 구간 맵 생성]
+    E --> F[청크 대기열]
+    F --> G[바운스 단위 월드 반영]
+    G --> H[Spatial Hash 충돌 탐색]
+    H --> I[화면 뒤 객체 점진 제거]
+```
 
-## continuous playback and live settings
+맵 청크는 운반 단위일 뿐 화면에 한 번에 나타나지 않습니다. 게임 루프가 처리 가능한 양만 반영해, 생성과 삭제가 프레임을 오래 점유하지 않도록 구성했습니다.
 
-choosing a song starts a continuous playlist from that song. while the current song is playing, maps and audio
-for the next two songs are prepared in the background. audio is queued only after its matching map is ready. a
-slow preparation waits safely at the transition, and a broken song is skipped without stopping the playlist.
+## 로컬 데이터와 공개 범위
 
-maps are generated incrementally in a worker process as time chunks. chunks are transport units only: their pegs
-and safe areas enter the live world one bounce at a time and fade in briefly instead of appearing as a block. old
-records are removed individually after they leave the expanded viewport, while visible history is preserved. a
-spatial hash limits collision and viewport queries. playback timing follows the mixer position when it is reliable and falls back to a
-monotonic wall clock. the performance HUD shows FPS, python memory, active/buffered chunks, pegs, particles,
-preparation time, transition wait, and measured synchronization drift.
-initial and streamed bounces share one schedule offset so chunk boundaries cannot reorder pending collisions.
+- `songs-local/` — 저작권이나 재배포 권한을 확인하지 않은 개인 음악
+- `imports-local/` — 음악 등록 중간 파일
+- `presets-local/` — 사용자 이미지와 스퀘어 프리셋
+- `exports/`, `logs/` — 빌드 결과와 실행 로그
 
-map generation remains 30 seconds ahead, but rendering is density-aware: only the next three to six readable pegs
-are shown. overlapping later markers are suppressed without dropping their notes, the immediate target is outlined
-and connected by a guide line, and at most three recent pegs fade out over 1.5 seconds behind the square.
-the first three visible targets are numbered, the immediate target gets a music-timed countdown ring, and each hit
-briefly compresses its peg and emits an expanding confirmation ring. the TargetLead camera frames the square and
-next peg together with capped look-ahead and frame-rate-independent smoothing.
+위 경로는 Git에서 제외되며 검증된 배포 패키지에도 포함되지 않습니다. 공개 저장소의 `songs/`에는 재배포가 허용된 곡만 추가해야 합니다.
 
-the square uses a layered neon core with directional edge lighting and a short collision-face flash. movement trail
-particles are replaced by four time-based afterimages. bounce particles use delta-time-independent motion, directional
-theme colors, adaptive counts for dense songs, alpha fade, and a global active-particle budget. glow surfaces are
-quantized and cached instead of rebuilding the OpenCV bloom on every frame.
+## 테스트와 Windows 배포
 
-press `F10` during gameplay to open the live settings overlay. use the up/down keys to select a setting and the
-left/right keys to change it. colors, bounce effects, particles, glow, camera mode, volume, map retention, peg count,
-peg spacing, target guide, and fades can be changed without stopping playback. the square's fixed outer body can use
-diamond, heart, star, circle, note, bolt, cross, or empty inner symbols with independent fill, outline, size, rotation,
-and bounce-pulse settings. these visual options never change the square hitbox or map physics. square speed, bounce spacing, and direction chance regenerate only the
-unplayed portion of the current map, starting from the square's current state.
+```powershell
+python -m unittest discover -s tests -q
+python tools/build_release.py
+```
 
-shorts mode is available from the same `F10` overlay. choose a vertical resolution such as `540x960`, `720x1280`,
-or `1080x1920` on the config page and restart. shorts mode keeps the square and immediate target inside configurable
-recording-safe margins with dynamic camera zoom, can hide gameplay/debug UI, shows a recording countdown and song
-title, and plays a repeatable 15, 30, or 60 second segment from a five-second-adjustable start point. segment and
-mode changes apply when the next song starts; clean UI, title, countdown, duration, and repeat can be changed live.
+배포 스크립트는 테스트 실행, 공개 파일 allowlist 검사, Windows 실행 파일 생성, 스트리밍·Shorts·음악 등록·커스터마이저 smoke test, 개인 데이터 혼입 검사를 거쳐 버전 ZIP과 SHA-256 파일을 `exports/releases/`에 생성합니다. 자세한 절차는 [배포 가이드](docs/RELEASE.md)를 참고하세요.
 
-## verified Windows release
+## 원작과 라이선스
 
-run `python tools/build_release.py` from the repository root. the release builder runs all unit tests, copies only
-the public files allow-listed in `packaging/release-manifest.txt`, builds the Windows application, launches the
-packaged streaming/shorts/import/customizer smoke suite from outside its install directory, rejects private data,
-and writes a versioned ZIP plus SHA-256 file under `exports/releases/`.
+- Upstream: [quasar098/midi-playground](https://github.com/quasar098/midi-playground)
+- Credits: [docs/CREDITS.md](docs/CREDITS.md)
+- License: [GNU GPL v3](LICENSE)
 
-when adding a redistribution-cleared built-in song or asset, add its path to the release manifest. files under
-`songs-local/`, `imports-local/`, `presets-local/`, `exports/`, logs, and user settings are never release inputs.
-see [docs/RELEASE.md](docs/RELEASE.md) for the complete checklist.
-
-## credits
-
-see [docs/CREDITS.md](https://github.com/quasar098/midi-playground/blob/master/docs/CREDITS.md)
-
-## contributors
-
-- [quasar098](https://github.com/quasar098)
-- [TheCodingCrafter](https://github.com/TheCodingCrafter) - Themes + QOL
-- [PurpleJuiceBox](https://github.com/PurpleJuiceBox) - Reset to Default Button
-- [sled45](https://github.com/sled45) - Mouse fix for high DPI displays
-- [Times0](https://github.com/Times0) - dark_modern theme, Glowing, Colored pegs on bounce
-- [Spring-Forever-with-me](https://github.com/Spring-Forever-with-me) - fix incorrect key name for screen resolution in the config
-- [sj-dan](https://github.com/sj-dan) - opengl fix on mac os
-
-- [cangerjun](https://github.com/cangerjun) - chinese translations
-- [lucmsilva651](https://github.com/lucmsilva651) - brazilian portuguese and spanish translations
-- [leo539](https://github.com/leo539) - french translations
-- [simpansoftware](https://github.com/simpansoftware) - swedish translations
-- [slideglide](https://github.com/slideglide) - turkish translations
-- [Guavvva](https://github.com/Guavvva) - russian translations
-
-## translation guide
-
-want to add translations for a different language? please create a github issue with the word "translations" in the title
-
-if so, please add translations for as many of the texts (they are listed below) as you can
-
-- "play"
-- "config"
-- "contribute"
-- "open songs folder"
-- "quit"
-- "back"
-- "midi-playground" text (this is the title of the software)
-- the marquee on the title screen (the moving text that appears underneath the title on the main screen; see translations.py file for english example)
-- "restart required"
-
-if you have any questions on what any texts are supposed to mean, see translations.py for the english examples before you make a github issue
-
-currently, this game can be played in english, chinese, russian, brazillian portuguese, spanish, french, turkish, and swedish.
-
-also, we are only adding real languages (no pirate speak or upside-down language like minecraft)
-
-## (old) todo list
-
-see [docs/TODO.md](https://github.com/quasar098/midi-playground/blob/master/docs/TODO.md)
+이 프로젝트의 수정본을 공개 배포할 때는 GPL-3.0 조건에 따라 해당 소스 코드도 제공해야 합니다.

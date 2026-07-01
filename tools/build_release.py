@@ -92,7 +92,10 @@ def build(skip_tests: bool = False) -> tuple[Path, Path]:
     if not skip_tests:
         run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"])
 
-    with TemporaryDirectory(prefix="midi-playground-release-") as temporary:
+    # GitHub's Windows runner checks the repository out on D: while the system
+    # temp directory is on C:. PyInstaller cannot make spec-relative paths
+    # across drives, so keep all transient build paths beside the checkout.
+    with TemporaryDirectory(prefix=".release-", dir=ROOT) as temporary:
         temp_root = Path(temporary)
         payload = temp_root / "payload"
         copied_count = copy_payload(payload)
