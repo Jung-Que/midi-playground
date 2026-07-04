@@ -232,16 +232,19 @@ class ConfigPage:
             text="Particles on Bounce:",
             manager=self.ui_manager
         )
+        resolution_options = list(dict.fromkeys([
+            f"{Config.rSCREEN_WIDTH}x{Config.rSCREEN_HEIGHT}",
+            *(f"{width}x{height}" for width, height in Config.RESOLUTION_PRESETS),
+        ]))
         self.s_resolution = pgui.elements.UIDropDownMenu(
-            [str(Config.rSCREEN_WIDTH) + "x" + str(Config.rSCREEN_HEIGHT), "800x600", "1024x768", "1280x720",
-             "1920x1080", "540x960", "720x1280", "1080x1920"],
+            resolution_options,
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH * 5 / 10, Config.SCREEN_HEIGHT * 8 // 10, 300, 30)),
             starting_option=str(Config.SCREEN_WIDTH) + "x" + str(Config.SCREEN_HEIGHT),
             manager=self.ui_manager
         )
         self.s_resolution_label = pgui.elements.UILabel(
             relative_rect=pygame.Rect((Config.SCREEN_WIDTH * 5 / 10, Config.SCREEN_HEIGHT * 8 // 10 - 30, 240, 30)),
-            text="Resolution (requires restart):",
+            text="Resolution / edit master (restart):",
             manager=self.ui_manager
         )
 

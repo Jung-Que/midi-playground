@@ -4,12 +4,14 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 import random
-from math import floor
+from math import ceil, floor, hypot, sqrt
 from threading import Lock
 from time import perf_counter
 from typing import Optional
 from uuid import uuid4
 from zipfile import ZipFile
+
+import pygame
 
 from bounce import Bounce
 from config import Config
@@ -36,6 +38,67 @@ class MapChunk:
     bounces: list[tuple[list[float], list[int], float, int]]
     start_pos: list[float] = field(default_factory=list)
     start_dir: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RollingMapPolicy:
+    path_speed: float
+    screen_diagonal: float
+    preload_seconds: float
+    retention_seconds: float
+    chunk_seconds: float
+    preload_distance: float
+    retention_distance: float
+    chunk_distance: float
+    buffer_chunks: int
+
+
+def rolling_map_policy(settings: Optional[dict] = None) -> RollingMapPolicy:
+    """Scale map windows by screen-space travel instead of fixed wall time."""
+    values = settings or {}
+
+    def value(name, default):
+        return values.get(name, getattr(Config, name, default))
+
+    width = max(float(value("SCREEN_WIDTH", 1920)), 1.0)
+    height = max(float(value("SCREEN_HEIGHT", 1080)), 1.0)
+    screen_diagonal = hypot(width, height)
+    path_speed = max(abs(float(value("square_speed", 600))) * sqrt(2.0), 1.0)
+
+    preload_distance = screen_diagonal * max(float(value("map_preload_screen_diagonals", 3.0)), 0.25)
+    retention_distance = screen_diagonal * max(float(value("map_retention_screen_diagonals", 1.5)), 0.25)
+    chunk_distance = screen_diagonal * max(float(value("map_chunk_screen_diagonals", 1.2)), 0.25)
+
+    preload_cap = max(float(value("map_preload_seconds", 30.0)), 0.0)
+    retention_cap = max(float(value("map_retention_seconds", 5.0)), 0.1)
+    chunk_cap = max(float(value("map_chunk_seconds", 15.0)), 0.25)
+    preload_min = max(float(value("map_preload_min_seconds", 4.0)), 0.0)
+    preload_max = max(float(value("map_preload_max_seconds", 12.0)), preload_min)
+    retention_min = max(float(value("map_retention_min_seconds", 1.5)), 0.1)
+    retention_max = max(float(value("map_retention_max_seconds", 8.0)), retention_min)
+    chunk_min = max(float(value("map_chunk_min_seconds", 2.0)), 0.25)
+    chunk_max = max(float(value("map_chunk_max_seconds", 6.0)), chunk_min)
+
+    preload_seconds = min(preload_cap, max(preload_min, min(preload_max, preload_distance / path_speed)))
+    retention_seconds = min(
+        retention_cap,
+        max(retention_min, min(retention_max, retention_distance / path_speed)),
+    )
+    chunk_seconds = min(chunk_cap, max(chunk_min, min(chunk_max, chunk_distance / path_speed)))
+    buffer_cap = max(int(value("map_stream_buffer_chunks", 8)), 1)
+    needed_chunks = max(2, ceil(preload_seconds / max(chunk_seconds, 0.25)) + 2)
+
+    return RollingMapPolicy(
+        path_speed=path_speed,
+        screen_diagonal=screen_diagonal,
+        preload_seconds=preload_seconds,
+        retention_seconds=retention_seconds,
+        chunk_seconds=chunk_seconds,
+        preload_distance=path_speed * preload_seconds,
+        retention_distance=path_speed * retention_seconds,
+        chunk_distance=path_speed * chunk_seconds,
+        buffer_chunks=min(buffer_cap, needed_chunks),
+    )
 
 
 @dataclass
@@ -81,6 +144,30 @@ def map_settings_snapshot() -> dict:
         "backtrack_amount",
         "map_retention_seconds",
         "map_chunk_seconds",
+        "map_preload_seconds",
+        "map_stream_buffer_chunks",
+        "map_preload_screen_diagonals",
+        "map_retention_screen_diagonals",
+        "map_chunk_screen_diagonals",
+        "map_preload_min_seconds",
+        "map_preload_max_seconds",
+        "map_retention_min_seconds",
+        "map_retention_max_seconds",
+        "map_chunk_min_seconds",
+        "map_chunk_max_seconds",
+        "map_path_lookahead_bounces",
+        "map_path_fast_lookahead_bounces",
+        "map_path_beam_width",
+        "map_path_commit_bounces",
+        "map_path_fast_interval_seconds",
+        "map_path_clearance_pixels",
+        "map_path_crossing_penalty",
+        "map_path_planned_segment_window",
+        "map_path_axis_run_penalty",
+        "map_path_drift_screen_diagonals",
+        "map_path_drift_penalty",
+        "SCREEN_WIDTH",
+        "SCREEN_HEIGHT",
         "spatial_cell_size",
     )
     return {name: getattr(Config, name) for name in names}
@@ -113,6 +200,56 @@ class StreamChunkResult:
     collision_conflicts: int = 0
 
 
+def _segments_cross(first, second, epsilon: float = 1e-6) -> bool:
+    """Return True for an interior crossing or a meaningful collinear overlap."""
+    a, b = first
+    c, d = second
+    if (
+        max(min(a[0], b[0]), min(c[0], d[0])) > min(max(a[0], b[0]), max(c[0], d[0])) + epsilon
+        or max(min(a[1], b[1]), min(c[1], d[1])) > min(max(a[1], b[1]), max(c[1], d[1])) + epsilon
+    ):
+        return False
+
+    def orientation(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    o1 = orientation(a, b, c)
+    o2 = orientation(a, b, d)
+    o3 = orientation(c, d, a)
+    o4 = orientation(c, d, b)
+    if o1 * o2 < -epsilon and o3 * o4 < -epsilon:
+        return True
+
+    if all(abs(value) <= epsilon for value in (o1, o2, o3, o4)):
+        axis = 0 if abs(b[0] - a[0]) >= abs(b[1] - a[1]) else 1
+        overlap = min(max(a[axis], b[axis]), max(c[axis], d[axis])) - max(
+            min(a[axis], b[axis]), min(c[axis], d[axis])
+        )
+        return overlap > epsilon
+    return False
+
+
+def _segment_bounds(segment) -> pygame.Rect:
+    start, end = segment
+    left = floor(min(start[0], end[0]))
+    top = floor(min(start[1], end[1]))
+    right = ceil(max(start[0], end[0]))
+    bottom = ceil(max(start[1], end[1]))
+    return pygame.Rect(left, top, max(right - left, 1), max(bottom - top, 1))
+
+
+@dataclass
+class _RouteCandidate:
+    x: float
+    y: float
+    direction: tuple[int, int]
+    previous_time: float
+    score: float
+    axes: tuple[int, ...]
+    collision_rects: tuple
+    path_segments: tuple
+
+
 class _WorkerMapSession:
     def __init__(
             self,
@@ -123,6 +260,7 @@ class _WorkerMapSession:
     ):
         for name, value in settings.items():
             setattr(Config, name, value)
+        policy = rolling_map_policy(settings)
         notes = notes[:Config.max_notes] if Config.max_notes is not None else notes
         self.notes = remove_too_close_values(notes, Config.bounce_min_spacing)
         if not self.notes:
@@ -130,15 +268,154 @@ class _WorkerMapSession:
         self.index = 0
         self.square = Square(*start_pos, *start_dir)
         self.previous_time = 0.0
-        self.rng = random.Random(Config.seed)
+        preference_rng = random.Random(Config.seed)
+        self.preferred_axes = tuple(
+            1 if preference_rng.random() * 100 < Config.direction_change_chance else 0
+            for _ in self.notes
+        )
+        self.planned_axes = deque()
         self.recent_colliders = deque()
+        self.recent_segments = deque()
         self.collision_index = SpatialHash(Config.spatial_cell_size)
+        self.path_index = SpatialHash(Config.spatial_cell_size)
+        self.path_segments = {}
         self.collider_sequence = 0
+        self.segment_sequence = 0
         self.collision_conflicts = 0
-        self.chunk_seconds = max(float(Config.map_chunk_seconds), 1.0)
-        self.collision_retention = max(float(Config.map_retention_seconds) * 2, 10.0)
+        self.chunk_seconds = policy.chunk_seconds
+        self.screen_diagonal = policy.screen_diagonal
+        self.collision_retention = max(policy.retention_seconds * 2, 4.0)
         self.initial_pos = start_pos.copy()
         self.initial_dir = start_dir.copy()
+
+    def _lookahead_depth(self) -> int:
+        remaining = len(self.notes) - self.index
+        base = max(int(Config.map_path_lookahead_bounces), 1)
+        fast = max(int(Config.map_path_fast_lookahead_bounces), base)
+        available = min(remaining, fast)
+        if available <= base:
+            return available
+
+        sample = self.notes[self.index:self.index + available]
+        average_interval = (sample[-1] - sample[0]) / max(len(sample) - 1, 1)
+        if average_interval <= max(float(Config.map_path_fast_interval_seconds), 0.01):
+            return available
+        return min(remaining, base)
+
+    def _collision_penalty(self, collision_rect, planned_rects: tuple) -> float:
+        clearance = max(int(Config.map_path_clearance_pixels), 0)
+        expanded = collision_rect.inflate(clearance * 2, clearance * 2)
+        exact_existing = len(self.collision_index.query(collision_rect))
+        near_existing = max(len(self.collision_index.query(expanded)) - exact_existing, 0)
+        exact_planned = sum(collision_rect.colliderect(rect) for rect in planned_rects)
+        near_planned = sum(
+            expanded.colliderect(rect) and not collision_rect.colliderect(rect)
+            for rect in planned_rects
+        )
+        return (
+            (exact_existing + exact_planned) * 10_000.0
+            + (near_existing + near_planned) * 120.0
+        )
+
+    def _path_crossing_penalty(self, segment, planned_segments: tuple, timestamp: float) -> float:
+        nearby_keys = self.path_index.query(_segment_bounds(segment))
+        crossings = sum(
+            _segments_cross(segment, self.path_segments[key])
+            for key in nearby_keys
+        )
+        planned_window = max(int(Config.map_path_planned_segment_window), 1)
+        crossings += sum(
+            _segments_cross(segment, other)
+            for other in planned_segments[-planned_window:]
+        )
+        return crossings * max(float(Config.map_path_crossing_penalty), 0.0)
+
+    def _remember_path_segment(self, timestamp: float, segment):
+        key = self.segment_sequence
+        self.segment_sequence += 1
+        self.path_segments[key] = segment
+        self.path_index.insert(key, _segment_bounds(segment))
+        self.recent_segments.append((timestamp, key))
+
+    def _plan_bounce_axes(self) -> tuple[int, ...]:
+        depth = self._lookahead_depth()
+        if depth <= 0:
+            return ()
+
+        beam_width = max(int(Config.map_path_beam_width), 1)
+        candidates = [_RouteCandidate(
+            x=float(self.square.x),
+            y=float(self.square.y),
+            direction=(int(self.square.dir_x), int(self.square.dir_y)),
+            previous_time=float(self.previous_time),
+            score=0.0,
+            axes=(),
+            collision_rects=(),
+            path_segments=(),
+        )]
+
+        for offset in range(depth):
+            note_index = self.index + offset
+            timestamp = self.notes[note_index]
+            preferred_axis = self.preferred_axes[note_index]
+            expanded_candidates = []
+            for candidate in candidates:
+                elapsed = max(timestamp - candidate.previous_time, 0.0)
+                x = candidate.x + candidate.direction[0] * Config.square_speed * elapsed
+                y = candidate.y + candidate.direction[1] * Config.square_speed * elapsed
+                segment = ((candidate.x, candidate.y), (x, y))
+                for axis in (preferred_axis, 1 - preferred_axis):
+                    direction = [candidate.direction[0], candidate.direction[1]]
+                    direction[axis] *= -1
+                    bounce = Bounce([x, y], direction, timestamp, axis)
+                    collision_rect = bounce.get_collision_rect()
+                    preference_penalty = 0.0 if axis == preferred_axis else 1.0
+                    repetition_penalty = 0.15 if candidate.axes and candidate.axes[-1] == axis else 0.0
+                    if len(candidate.axes) >= 2 and candidate.axes[-2:] == (axis, axis):
+                        repetition_penalty += max(float(Config.map_path_axis_run_penalty), 0.0)
+                    drift_limit = self.screen_diagonal * max(
+                        float(Config.map_path_drift_screen_diagonals), 0.25
+                    )
+                    drift_excess = max(
+                        hypot(x - self.square.x, y - self.square.y) - drift_limit,
+                        0.0,
+                    )
+                    drift_penalty = (
+                        (drift_excess / max(self.screen_diagonal, 1.0)) ** 2
+                        * max(float(Config.map_path_drift_penalty), 0.0)
+                    )
+                    expanded_candidates.append(_RouteCandidate(
+                        x=x,
+                        y=y,
+                        direction=(direction[0], direction[1]),
+                        previous_time=timestamp,
+                        score=(
+                            candidate.score
+                            + self._collision_penalty(collision_rect, candidate.collision_rects)
+                            + self._path_crossing_penalty(segment, candidate.path_segments, timestamp)
+                            + preference_penalty
+                            + repetition_penalty
+                            + drift_penalty
+                        ),
+                        axes=(*candidate.axes, axis),
+                        collision_rects=(*candidate.collision_rects, collision_rect),
+                        path_segments=(*candidate.path_segments, segment),
+                    ))
+            candidates = sorted(
+                expanded_candidates,
+                key=lambda candidate: (candidate.score, candidate.axes),
+            )[:beam_width]
+
+        return min(candidates, key=lambda candidate: (candidate.score, candidate.axes)).axes
+
+    def _next_bounce_axis(self) -> int:
+        if not self.planned_axes:
+            plan = self._plan_bounce_axes()
+            commit_count = max(int(Config.map_path_commit_bounces), 1)
+            self.planned_axes.extend(plan[:commit_count])
+        if self.planned_axes:
+            return self.planned_axes.popleft()
+        return self.preferred_axes[self.index]
 
     def next_chunk(self, session_id: str, include_notes: bool) -> StreamChunkResult:
         started_at = perf_counter()
@@ -151,24 +428,26 @@ class _WorkerMapSession:
 
         while self.index < len(self.notes) and self.notes[self.index] < chunk_end:
             timestamp = self.notes[self.index]
-            elapsed = max(timestamp - self.previous_time, 0.0)
-            self.square.x += self.square.dir_x * Config.square_speed * elapsed
-            self.square.y += self.square.dir_y * Config.square_speed * elapsed
-
             while self.recent_colliders and self.recent_colliders[0][0] < timestamp - self.collision_retention:
                 _, expired_key = self.recent_colliders.popleft()
                 self.collision_index.remove(expired_key)
+            while self.recent_segments and self.recent_segments[0][0] < timestamp - self.collision_retention:
+                _, expired_key = self.recent_segments.popleft()
+                self.path_index.remove(expired_key)
+                self.path_segments.pop(expired_key, None)
 
-            preferred_axis = 1 if self.rng.random() * 100 < Config.direction_change_chance else 0
-            candidates = []
-            for axis in (preferred_axis, 1 - preferred_axis):
-                direction = self.square.dir.copy()
-                direction[axis] *= -1
-                candidate = Bounce(self.square.pos, direction, timestamp, axis)
-                collision_rect = candidate.get_collision_rect()
-                candidates.append((len(self.collision_index.query(collision_rect)), candidate, collision_rect))
+            selected_axis = self._next_bounce_axis()
+            segment_start = (float(self.square.x), float(self.square.y))
+            elapsed = max(timestamp - self.previous_time, 0.0)
+            self.square.x += self.square.dir_x * Config.square_speed * elapsed
+            self.square.y += self.square.dir_y * Config.square_speed * elapsed
+            segment_end = (float(self.square.x), float(self.square.y))
 
-            collisions, selected, collision_rect = min(candidates, key=lambda item: item[0])
+            direction = self.square.dir.copy()
+            direction[selected_axis] *= -1
+            selected = Bounce(self.square.pos, direction, timestamp, selected_axis)
+            collision_rect = selected.get_collision_rect()
+            collisions = len(self.collision_index.query(collision_rect))
             if collisions:
                 self.collision_conflicts += 1
             self.square.dir = selected.square_dir.copy()
@@ -180,6 +459,7 @@ class _WorkerMapSession:
             ))
             self.collision_index.insert(self.collider_sequence, collision_rect)
             self.recent_colliders.append((timestamp, self.collider_sequence))
+            self._remember_path_segment(timestamp, (segment_start, segment_end))
             self.collider_sequence += 1
             self.previous_time = timestamp
             self.index += 1
@@ -240,50 +520,23 @@ def close_song_map_stream(session_id: str):
 def _generate_streaming_bounces(
         notes: list[float], start_pos: list[float], start_dir: list[int], start_time: float = 0.0
 ) -> tuple[list[Bounce], list[float], int]:
-    notes = notes[:Config.max_notes] if Config.max_notes is not None else notes
-    notes = remove_too_close_values(notes, Config.bounce_min_spacing)
-    if not notes:
-        raise MapLoadingFailureError("The map does not contain any playable notes")
-
-    rng = random.Random(Config.seed)
-    square = Square(*start_pos, *start_dir)
+    session = _WorkerMapSession(
+        notes,
+        map_settings_snapshot(),
+        start_pos,
+        start_dir,
+    )
+    session.previous_time = start_time
     output = []
-    recent_colliders = deque()
-    collision_index = SpatialHash(Config.spatial_cell_size)
-    collision_conflicts = 0
-    previous_time = start_time
-    collision_retention = max(float(Config.map_retention_seconds) * 2, 10.0)
-
-    for timestamp in notes:
-        elapsed = max(timestamp - previous_time, 0.0)
-        square.x += square.dir_x * Config.square_speed * elapsed
-        square.y += square.dir_y * Config.square_speed * elapsed
-
-        while recent_colliders and recent_colliders[0][0] < timestamp - collision_retention:
-            _, expired_key = recent_colliders.popleft()
-            collision_index.remove(expired_key)
-
-        preferred_axis = 1 if rng.random() * 100 < Config.direction_change_chance else 0
-        axes = (preferred_axis, 1 - preferred_axis)
-        candidates = []
-        for axis in axes:
-            direction = square.dir.copy()
-            direction[axis] *= -1
-            candidate = Bounce(square.pos, direction, timestamp, axis)
-            collision_rect = candidate.get_collision_rect()
-            collisions = len(collision_index.query(collision_rect))
-            candidates.append((collisions, candidate, collision_rect))
-
-        collisions, selected, collision_rect = min(candidates, key=lambda item: item[0])
-        if collisions:
-            collision_conflicts += 1
-        square.dir = selected.square_dir.copy()
-        output.append(selected)
-        collider_key = len(output) - 1
-        collision_index.insert(collider_key, collision_rect)
-        recent_colliders.append((timestamp, collider_key))
-        previous_time = timestamp
-    return output, notes, collision_conflicts
+    complete = False
+    while not complete:
+        result = session.next_chunk("inline-map", include_notes=False)
+        output.extend(
+            Bounce(position, direction, timestamp, axis)
+            for position, direction, timestamp, axis in result.chunk.bounces
+        )
+        complete = result.complete
+    return output, session.notes.copy(), session.collision_conflicts
 
 
 def prepare_song_map(
@@ -320,7 +573,7 @@ def prepare_notes_map(
         (bounce.square_pos.copy(), bounce.square_dir.copy(), bounce.time, bounce.bounce_dir)
         for bounce in bounces
     ]
-    chunk_seconds = max(float(settings.get("map_chunk_seconds", 15.0)), 1.0)
+    chunk_seconds = rolling_map_policy(settings).chunk_seconds
     chunks: list[MapChunk] = []
     for bounce in serialized:
         chunk_start = int(bounce[2] // chunk_seconds) * chunk_seconds
@@ -427,8 +680,16 @@ class PlaylistController:
     def _invalidate_streams(self):
         old_slots = [slot for slot in [self.active_slot, *self.slots] if slot is not None]
         self._generation += 1
-        if self._map_executor is not None:
-            for slot in old_slots:
+        for slot in old_slots:
+            if slot.map_started and not slot.map_complete:
+                slot.map_inflight = False
+                if not slot.error:
+                    slot.error = "Map stream superseded"
+                if not slot.map_future.done():
+                    slot.map_future.set_exception(RuntimeError(slot.error))
+                if not slot.complete_future.done():
+                    slot.complete_future.set_exception(RuntimeError(slot.error))
+            if self._map_executor is not None:
                 if slot.map_started and not slot.map_complete:
                     self._map_executor.submit(close_song_map_stream, slot.session_id)
 
@@ -487,7 +748,7 @@ class PlaylistController:
     def _submit_stream_continue(self, slot: PrefetchSlot):
         if slot.map_complete or slot.map_inflight or slot.error:
             return
-        if len(slot.chunk_queue) >= max(int(Config.map_stream_buffer_chunks), 1):
+        if len(slot.chunk_queue) >= rolling_map_policy().buffer_chunks:
             return
         self._ensure_map_executor()
         slot.map_inflight = True
@@ -505,6 +766,7 @@ class PlaylistController:
             first: bool,
     ):
         if generation != self._generation:
+            slot.map_inflight = False
             return
         try:
             result: StreamChunkResult = future.result()

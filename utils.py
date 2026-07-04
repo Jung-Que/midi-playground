@@ -96,7 +96,15 @@ def surf_to_texture(in_surface: pygame.Surface) -> moderngl.Texture:
 
 
 def update_screen(screen: pygame.Surface, glsl_program: moderngl.Program, render_object: moderngl.VertexArray):
-    frame_tex = surf_to_texture(screen)
+    frame_tex = Config.frame_texture
+    if frame_tex is None or frame_tex.size != screen.get_size():
+        if frame_tex is not None:
+            frame_tex.release()
+        frame_tex = Config.ctx.texture(screen.get_size(), 4)
+        frame_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        frame_tex.swizzle = 'BGRA'
+        Config.frame_texture = frame_tex
+    frame_tex.write(screen.get_view('1'))
     frame_tex.use(0)
     glsl_program['tex'] = 0
     if "ascii.glsl" in Config.shader_file_name:
@@ -110,8 +118,6 @@ def update_screen(screen: pygame.Surface, glsl_program: moderngl.Program, render
     render_object.render(mode=moderngl.TRIANGLE_STRIP)
 
     pygame.display.flip()
-
-    frame_tex.release()
 
 
 def open_file(filename):

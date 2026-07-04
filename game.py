@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
 from math import ceil
-from time import monotonic
+from time import monotonic, perf_counter
 import tracemalloc
 from audioclock import AudioClock
 from streaming import (
@@ -21,6 +21,7 @@ from streaming import (
     prepare_notes_map,
     prepare_song_map,
     read_song_audio,
+    rolling_map_policy,
     song_to_spec,
 )
 
@@ -39,6 +40,8 @@ class RuntimeMapChunk:
     safe_area_times: list[float]
     bounce_data: list[tuple[list[float], list[int], float, int]] = field(default_factory=list)
     start_position: list[float] = field(default_factory=list)
+    materialize_position: list[float] = field(default_factory=list)
+    materialize_cursor: int = 0
     materialized: bool = True
     geometry_cursor: int = 0
     safe_area_cursor: int = 0
@@ -81,6 +84,7 @@ class Game:
         self.active_map_stream = None
         self.consecutive_skips = 0
         self.fps_smoothed = 0.0
+        self.frame_times = deque(maxlen=720)
         self.visible_peg_count = 0
         self.peg_order_font = get_font(16)
         self.square_afterimages = deque(maxlen=max(int(Config.square_afterimage_count), 1))
@@ -98,6 +102,12 @@ class Game:
         self.master_start_pos = [0.0, 0.0]
         self.master_start_dir = [1, 1]
         self.current_audio_source = None
+        self.current_map_lead_seconds = 0.0
+        self._last_prune_map_time = float("-inf")
+        self.last_materialized_records = 0
+        self.last_materialize_ms = 0.0
+        self.last_pruned_records = 0
+        self._last_materialize_map_time = None
 
     def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
         self.stop_playlist(recreate_controller=True)
@@ -139,6 +149,11 @@ class Game:
         self.afterimage_elapsed = 0.0
         self.map_chunks = deque()
         self._active_chunk_signature = None
+        self._last_prune_map_time = float("-inf")
+        self._last_materialize_map_time = None
+        self.last_materialized_records = 0
+        self.last_materialize_ms = 0.0
+        self.last_pruned_records = 0
         self.active_map_stream = prepared.stream_slot if prepared is not None else None
         self.music_has_played = audio_already_playing
         self.offset_happened = seamless
@@ -349,21 +364,34 @@ class Game:
                 safe_area_times=[],
                 bounce_data=list(chunk.bounces),
                 start_position=chunk_start_position.copy(),
+                materialize_position=chunk_start_position.copy(),
                 materialized=False,
             ))
             if chunk.bounces:
                 previous_position = chunk.bounces[-1][0].copy()
         return runtime_chunks
 
-    def _materialize_chunk(self, chunk: RuntimeMapChunk):
-        if chunk.materialized:
-            return
+    def _materialize_chunk_step(
+            self,
+            chunk: RuntimeMapChunk,
+            horizon: float,
+            record_limit: int,
+            deadline: float,
+    ) -> int:
+        if chunk.materialized or record_limit <= 0:
+            return 0
         palette = [
             (224, 50, 50), (80, 210, 100), (230, 220, 50),
             (174, 170, 210), (245, 77, 247), (255, 153, 0),
         ]
-        previous = self._square_rect(chunk.start_position)
-        for position, direction, timestamp, axis in chunk.bounce_data:
+        processed = 0
+        previous = self._square_rect(chunk.materialize_position or chunk.start_position)
+        while chunk.materialize_cursor < len(chunk.bounce_data) and processed < record_limit:
+            if perf_counter() >= deadline:
+                break
+            position, direction, timestamp, axis = chunk.bounce_data[chunk.materialize_cursor]
+            if timestamp > horizon:
+                break
             bounce = Bounce(position, direction, timestamp, axis)
             target = self._square_rect(position)
             chunk.rectangles.append(bounce.get_collision_rect())
@@ -372,19 +400,42 @@ class Game:
             chunk.safe_areas.append(previous.union(target))
             chunk.safe_area_times.append(timestamp)
             previous = target
-        chunk.bounce_data = []
-        chunk.materialized = True
+            chunk.materialize_position = position.copy()
+            chunk.materialize_cursor += 1
+            processed += 1
+        if chunk.materialize_cursor >= len(chunk.bounce_data):
+            chunk.bounce_data = []
+            chunk.materialize_cursor = 0
+            chunk.materialized = True
+        return processed
 
     def _refresh_map_window(self, map_time: float, force: bool = False):
-        cutoff = map_time - float(Config.map_retention_seconds)
-        horizon = map_time + float(Config.map_preload_seconds)
+        policy = rolling_map_policy()
+        cutoff = map_time - policy.retention_seconds
+        horizon = map_time + policy.preload_seconds
+        record_budget = max(int(Config.map_materialize_max_records), 1)
+        time_budget_ms = max(float(Config.map_materialize_budget_ms), 0.1)
+        if force:
+            time_budget_ms *= 4
+        if not force and self._last_materialize_map_time == map_time:
+            record_budget = 0
+        else:
+            self._last_materialize_map_time = map_time
+        started_at = perf_counter()
+        deadline = started_at + time_budget_ms / 1000
+        materialized_records = 0
 
         # Chunks are generation/transport units only. Reveal their contents one
         # bounce at a time so a 15-second chunk never pops into the scene at once.
         for chunk in self.map_chunks:
             if chunk.start_time > horizon:
                 break
-            self._materialize_chunk(chunk)
+            materialized_records += self._materialize_chunk_step(
+                chunk,
+                horizon,
+                record_budget - materialized_records,
+                deadline,
+            )
             while (
                     chunk.geometry_cursor < len(chunk.rectangles) and
                     chunk.collision_times[chunk.geometry_cursor] <= horizon
@@ -411,12 +462,14 @@ class Game:
                 self.safe_area_visible_since.append(monotonic())
                 self.world.safe_area_index.insert(target_index, rect)
                 chunk.safe_area_cursor += 1
+            if materialized_records >= record_budget or perf_counter() >= deadline:
+                break
 
         # Once a chunk has handed off all of its records, its metadata can go.
         # Render records have their own per-item retention lifecycle below.
         while self.map_chunks:
             first = self.map_chunks[0]
-            fully_revealed = (
+            fully_revealed = first.materialized and (
                 first.geometry_cursor >= len(first.rectangles) and
                 first.safe_area_cursor >= len(first.safe_areas)
             )
@@ -431,6 +484,8 @@ class Game:
         self._active_chunk_signature = (
             len(self.map_chunks), len(self.world.rectangles), len(self.safe_areas)
         )
+        self.last_materialized_records = materialized_records
+        self.last_materialize_ms = (perf_counter() - started_at) * 1000
 
     def _ingest_stream_chunks(self, map_time: float):
         if self.active_map_stream is None:
@@ -447,7 +502,7 @@ class Game:
                 self.playlist.prepare_ahead(start_pos, start_dir)
             self.stream_message = f"Current map stream stopped safely: {error}"
             return
-        horizon = map_time + float(Config.map_preload_seconds)
+        horizon = map_time + rolling_map_policy().preload_seconds
         chunks = self.playlist.claim_chunks_until(self.active_map_stream, horizon)
         if chunks:
             for chunk in chunks:
@@ -526,7 +581,11 @@ class Game:
         if not self.auto_advance:
             return
         start_pos, start_dir = self._end_state()
-        if self.playlist.slots:
+        # The first track owns active_slot before any future slots exist. Calling
+        # prepare_ahead here would invalidate that live stream after its first
+        # chunk. Preserve the active slot and let ensure_prefetch chain future
+        # maps from its eventual end state.
+        if self.playlist.active_slot is not None or self.playlist.slots:
             self.playlist.ensure_prefetch(start_pos, start_dir)
         else:
             self.playlist.prepare_ahead(start_pos, start_dir)
@@ -731,9 +790,18 @@ class Game:
         self.playlist.shutdown()
 
     def _prune_rolling_world(self, screen_rect: pygame.Rect):
-        retention = float(Config.map_retention_seconds)
+        policy = rolling_map_policy()
+        retention = policy.retention_seconds
         map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
         self._refresh_map_window(map_time)
+        prune_interval = max(float(Config.map_prune_interval_seconds), 0.0)
+        if (
+                map_time >= self._last_prune_map_time and
+                map_time - self._last_prune_map_time < prune_interval
+        ):
+            self.last_pruned_records = 0
+            return
+        self._last_prune_map_time = map_time
         self._ensure_map_metadata_alignment()
         cutoff = map_time - retention
         margin = max(float(Config.map_view_margin), 0.0)
@@ -744,13 +812,17 @@ class Game:
 
         geometry_count = len(self.world.rectangles)
         kept_geometry = []
+        prune_budget = max(int(Config.map_prune_max_records), 1)
+        pruned_geometry = 0
         for rect, collision_time, color, visible_since in zip(
                 self.world.rectangles, self.world.collision_times, self.world.colors,
                 self.geometry_visible_since,
         ):
             visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
-            if collision_time >= cutoff or visible_nearby:
+            if collision_time >= cutoff or visible_nearby or pruned_geometry >= prune_budget:
                 kept_geometry.append((rect, collision_time, color, visible_since))
+            else:
+                pruned_geometry += 1
         self.world.rectangles = [item[0] for item in kept_geometry]
         self.world.collision_times = [item[1] for item in kept_geometry]
         self.world.colors = [item[2] for item in kept_geometry]
@@ -758,17 +830,21 @@ class Game:
 
         safe_area_count = len(self.safe_areas)
         kept_safe_areas = []
+        pruned_safe_areas = 0
         for rect, area_time, visible_since in zip(
                 self.safe_areas, self.safe_area_times, self.safe_area_visible_since
         ):
             visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
-            if area_time >= cutoff or visible_nearby:
+            if area_time >= cutoff or visible_nearby or pruned_safe_areas >= prune_budget:
                 kept_safe_areas.append((rect, area_time, visible_since))
+            else:
+                pruned_safe_areas += 1
         self.safe_areas = [item[0] for item in kept_safe_areas]
         self.safe_area_times = [item[1] for item in kept_safe_areas]
         self.safe_area_visible_since = [item[2] for item in kept_safe_areas]
         if geometry_count != len(kept_geometry) or safe_area_count != len(kept_safe_areas):
             self.world.rebuild_spatial_indexes(self.safe_areas)
+        self.last_pruned_records = pruned_geometry + pruned_safe_areas
         self.world.prune_past_bounces(retention)
 
     def _ensure_map_metadata_alignment(self):
@@ -820,9 +896,10 @@ class Game:
         def select_non_overlapping(candidates, limit):
             selected = []
             occupied = []
-            # Look slightly farther than the visible limit so an overlapping
-            # distant marker does not prevent a clearer marker from replacing it.
-            for index in candidates[:max(limit * 2, limit)]:
+            # Search beyond the visible cap so dense or overlapping notes can
+            # be replaced by later readable targets instead of shrinking the
+            # preview back to only two or three pegs.
+            for index in candidates[:max(limit * 4, limit)]:
                 bounds = self.world.rectangles[index].inflate(padding * 2, padding * 2)
                 if occupied and any(bounds.colliderect(other) for other in occupied):
                     continue
@@ -880,27 +957,36 @@ class Game:
         if self.afterimage_elapsed >= interval:
             self.afterimage_elapsed %= interval
             self.square_afterimages.append((
-                self.world.square.rect.copy(),
-                self.world.square.accent_color(),
+                self.world.square.pos.copy(),
+                float(Config.SQUARE_SIZE),
+                self.world.square.rendered_accent_color(),
                 now,
             ))
 
         lifetime = max(float(Config.square_afterimage_seconds), 0.001)
         alive = deque(maxlen=max(int(Config.square_afterimage_count), 1))
         self._afterimage_layer = self._ensure_effect_layer(self._afterimage_layer, screen)
-        for rect, color, created_at in self.square_afterimages:
+        for position, size, color, created_at in self.square_afterimages:
             progress = (now - created_at) / lifetime
             if progress >= 1.0:
                 continue
-            alive.append((rect, color, created_at))
-            alpha = int(120 * (1.0 - max(progress, 0.0)) ** 2)
-            offsetted = self.camera.offset(rect)
+            alive.append((position, size, color, created_at))
+            alpha = int(88 * (1.0 - max(progress, 0.0)) ** 2)
+            shrink = 1.0 - 0.08 * max(progress, 0.0)
+            offsetted = self.camera.project_centered_rect(position, size * shrink)
+            radius = max(2, min(int(Config.square_body_corner_radius), offsetted.width // 2))
+            pygame.draw.rect(
+                self._afterimage_layer,
+                (*pygame.Color(color)[:3], max(1, alpha // 4)),
+                offsetted,
+                border_radius=radius,
+            )
             pygame.draw.rect(
                 self._afterimage_layer,
                 (*pygame.Color(color)[:3], alpha),
                 offsetted,
-                width=max(2, rect.width // 12),
-                border_radius=max(2, rect.width // 7),
+                width=max(1, int(Config.square_body_border_width) // 2),
+                border_radius=radius,
             )
         self.square_afterimages = alive
         screen.blit(self._afterimage_layer, (0, 0))
@@ -1010,6 +1096,10 @@ class Game:
         elif self.shorts_session_active:
             self.world.time += self.playback_origin
         map_time = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
+        if self.world.future_bounces:
+            self.current_map_lead_seconds = max(self.world.future_bounces[-1].time - map_time, 0.0)
+        else:
+            self.current_map_lead_seconds = 0.0
         self._ingest_stream_chunks(map_time)
         if self._handle_short_segment_end(map_time, screen):
             map_time = self.playback_origin
@@ -1040,14 +1130,15 @@ class Game:
         world_view = self.camera.world_view(screen_rect)
 
         # bounce anim
-        sqrect = self.camera.offset(self.world.square.rect)
+        sqrect = self.camera.project_centered_rect(self.world.square.pos, Config.SQUARE_SIZE)
         if Config.bounce_effect and (self.world.time - 0.25) + Config.music_offset / 1000 < self.world.square.last_bounce_time:
             lerp = abs((self.world.time - 0.25 + Config.music_offset / 1000) - self.world.square.last_bounce_time) * 5
             lerp = lerp ** 2  # square it for better-looking interpolation
+            squash = max(1, round(min(sqrect.width, sqrect.height) * 0.08 * lerp))
             if self.world.square.latest_bounce_direction:
-                sqrect.inflate_ip((lerp * 5, -10 * lerp))
+                sqrect.inflate_ip(squash // 2, -squash)
             else:
-                sqrect.inflate_ip((-10 * lerp, lerp * 5))
+                sqrect.inflate_ip(-squash, squash // 2)
 
         # safe areas
         total_rects = 0
@@ -1284,6 +1375,7 @@ class Game:
 
     def _draw_performance_hud(self, screen: pygame.Surface):
         instant_fps = 1.0 / max(float(Config.dt), 0.0001)
+        self.frame_times.append(max(float(Config.dt), 0.0001))
         if self.fps_smoothed <= 0:
             self.fps_smoothed = instant_fps
         else:
@@ -1294,13 +1386,35 @@ class Game:
         if not tracemalloc.is_tracing():
             tracemalloc.start()
         memory_bytes, _ = tracemalloc.get_traced_memory()
+        ordered_frame_times = sorted(self.frame_times)
+        p95_index = min(len(ordered_frame_times) - 1, round((len(ordered_frame_times) - 1) * 0.95))
+        p99_index = min(len(ordered_frame_times) - 1, round((len(ordered_frame_times) - 1) * 0.99))
+        p95_ms = ordered_frame_times[p95_index] * 1000
+        p99_ms = ordered_frame_times[p99_index] * 1000
+        one_percent_low = 1.0 / max(ordered_frame_times[p99_index], 0.0001)
         metrics = self.playlist.metrics()
+        map_policy = rolling_map_policy()
+        active_stream = self.active_map_stream
+        if active_stream is None:
+            stream_state = "complete"
+        elif active_stream.error:
+            stream_state = "error"
+        elif active_stream.map_complete:
+            stream_state = "complete"
+        elif active_stream.map_inflight:
+            stream_state = "inflight"
+        else:
+            stream_state = "buffered"
         wait_ms = 0.0
         if self.transition_pending and self.transition_wait_started_at:
             wait_ms = (get_current_time() - self.transition_wait_started_at) * 1000
         lines = (
             f"FPS {self.fps_smoothed:5.1f} | Python memory {memory_bytes / 1024 / 1024:5.1f} MB",
+            f"Frame {Config.dt * 1000:5.2f} ms | p95 {p95_ms:5.2f} | p99 {p99_ms:5.2f} | 1% low {one_percent_low:5.1f}",
             f"Chunks {self.active_map_chunk_count}+{metrics['buffered_chunks']} buffered | Pegs {self.visible_peg_count}/{len(self.world.rectangles)} | Particles {len(self.world.particles)}",
+            f"Map ahead {map_policy.preload_seconds:4.1f}s/{map_policy.preload_distance:,.0f}px | behind {map_policy.retention_seconds:4.1f}s/{map_policy.retention_distance:,.0f}px | chunk {map_policy.chunk_seconds:3.1f}s",
+            f"Current lead {self.current_map_lead_seconds:4.1f}s | stream {stream_state}",
+            f"Map apply {self.last_materialized_records}/{self.last_materialize_ms:4.2f} ms | pruned {self.last_pruned_records}",
             f"Prefetch {metrics['ready']}/{metrics['queued']} | Map {metrics['map_ms']:.0f} ms | Audio {metrics['audio_ms']:.0f} ms",
             f"Prepare {metrics['pending_ms']:.0f} ms | Wait {wait_ms:.0f} ms | Sync {self.transition_lag_ms:.0f} ms",
         )
