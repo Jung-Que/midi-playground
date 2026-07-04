@@ -20,7 +20,7 @@ vec4 lookupASCII(float asciiValue) {
 
 void main(void) {
 
-	vec2 invViewport = vec2(1.0) / vec2(1920, 1080);
+	vec2 invViewport = vec2(1.0) / vec2(textureSize(tex, 0));
 	vec2 pixelSize = fontSize;
 	vec4 sum = vec4(0.0);
 	vec2 uvClamped = uvs-mod(uvs,pixelSize * invViewport);

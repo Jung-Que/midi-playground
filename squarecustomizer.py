@@ -21,6 +21,10 @@ STYLE_FIELDS = (
     "square_core_rotation_speed",
     "square_core_pulse_strength",
     "square_core_image_path",
+    "square_body_border_width",
+    "square_body_corner_radius",
+    "square_edge_highlight",
+    "square_border_pulse_strength",
 )
 DEFAULT_STYLE = {
     "square_core_shape": "diamond",
@@ -31,6 +35,10 @@ DEFAULT_STYLE = {
     "square_core_rotation_speed": 0,
     "square_core_pulse_strength": 0.15,
     "square_core_image_path": "",
+    "square_body_border_width": 3,
+    "square_body_corner_radius": 6,
+    "square_edge_highlight": False,
+    "square_border_pulse_strength": 0.35,
 }
 BUILTIN_PRESETS = {
     "Classic Diamond": DEFAULT_STYLE,
@@ -109,6 +117,9 @@ def validate_style(data) -> StyleValidation:
         "square_core_outline_width": (0, 6, int),
         "square_core_rotation_speed": (-180, 180, int),
         "square_core_pulse_strength": (0.0, 0.4, float),
+        "square_body_border_width": (1, 8, int),
+        "square_body_corner_radius": (0, 16, int),
+        "square_border_pulse_strength": (0.0, 1.0, float),
     }
     for name, (minimum, maximum, converter) in ranges.items():
         raw = data.get(name, style[name])
@@ -118,6 +129,12 @@ def validate_style(data) -> StyleValidation:
             warnings.append(f"Invalid {name}; default used")
             value = style[name]
         style[name] = max(minimum, min(maximum, value))
+
+    edge_highlight = data.get("square_edge_highlight", style["square_edge_highlight"])
+    if not isinstance(edge_highlight, bool):
+        warnings.append("Invalid square_edge_highlight; default used")
+        edge_highlight = style["square_edge_highlight"]
+    style["square_edge_highlight"] = edge_highlight
 
     image_path = data.get("square_core_image_path", "")
     style["square_core_image_path"] = str(image_path) if image_path else ""

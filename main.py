@@ -50,11 +50,16 @@ def run_stream_smoke_test() -> int:
     game = Game()
     game.active = True
     try:
-        song = make_song_from_zip("songs/tetris.zip")
-        error = game.start_playlist([song], 0, screen)
+        songs = [
+            make_song_from_zip("songs/tetris.zip"),
+            make_song_from_zip("songs/bad-piggies.zip"),
+        ]
+        error = game.start_playlist(songs, 0, screen)
         if error:
             raise RuntimeError(error)
         slot = game.active_map_stream
+        if slot is None or game.playlist.active_slot is not slot:
+            raise RuntimeError("First track map stream was detached during prefetch")
         deadline = monotonic() + 30
         chunks_seen = 1
         while not game.playlist.stream_drained(slot) and monotonic() < deadline:
@@ -319,7 +324,11 @@ def main():
 
     # game loop
     running = True
+    last_frame_at = monotonic() - 1 / max(FRAMERATE, 1)
     while running:
+        frame_at = monotonic()
+        Config.dt = max(0.0001, min(frame_at - last_frame_at, 0.1))
+        last_frame_at = frame_at
         n_frames += 1
         # thanks to TheCodingCrafter for the implementation
         if Config.theme == "rainbow":
@@ -478,9 +487,12 @@ def main():
         live_config.draw(screen, game.active)
 
         update_screen(screen, glsl_program, render_object)
-
-        Config.dt = clock.tick(FRAMERATE) / 1000
+        if not do_vsync:
+            clock.tick(FRAMERATE)
     game.shutdown()
+    if Config.frame_texture is not None:
+        Config.frame_texture.release()
+        Config.frame_texture = None
     pygame.quit()
     save_to_file()
 

@@ -45,6 +45,23 @@ class Camera:
                 round((pos_or_rect[1] - self.y) * self.zoom),
             ]
 
+    def project_centered_rect(self, center, size) -> pygame.Rect:
+        """Project a float world-space center with a single final pixel rounding."""
+        if isinstance(size, (int, float)):
+            width = height = float(size)
+        else:
+            width, height = map(float, size)
+        projected_width = max(1, round(width * self.zoom))
+        projected_height = max(1, round(height * self.zoom))
+        center_x = (float(center[0]) - self.x) * self.zoom
+        center_y = (float(center[1]) - self.y) * self.zoom
+        return pygame.Rect(
+            round(center_x - projected_width / 2),
+            round(center_y - projected_height / 2),
+            projected_width,
+            projected_height,
+        )
+
     def world_view(self, screen_rect: pygame.Rect) -> pygame.Rect:
         zoom = max(self.zoom, 0.001)
         return pygame.Rect(

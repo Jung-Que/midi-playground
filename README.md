@@ -117,3 +117,19 @@ python tools/build_release.py
 - License: [GNU GPL v3](LICENSE)
 
 이 프로젝트의 수정본을 공개 배포할 때는 GPL-3.0 조건에 따라 해당 소스 코드도 제공해야 합니다.
+
+## 추가 개선과 영상 업스케일링
+
+맵 스트리밍과 렌더링 안정성을 개선하고, 녹화본을 편집용 고해상도 마스터로 변환하는 보조 도구를 제공합니다.
+
+- 화면 이동 거리와 해상도에 맞춰 맵 look-ahead, history, chunk duration과 worker buffer를 조절하는 적응형 rolling window
+- 프레임별 적용·제거 시간 예산과 HUD 지표 확장
+- 스퀘어 외곽선, 모서리, 방향광과 잔상 표현 보정
+- `1440x2560`, `2160x3840` 세로 캡처 옵션과 편집용 2배 업스케일 도구
+
+```powershell
+winget install Gyan.FFmpeg
+python tools/upscale_video.py "input.mp4"
+```
+
+업스케일 도구는 원본 프레임률과 오디오를 유지하고 Lanczos 확대와 제한적인 샤프닝을 적용합니다. 다만 원본에 없던 디테일을 복원하는 방식은 아니므로, 확대 편집이 필요하면 네이티브 `2160x3840` 캡처를 우선합니다.

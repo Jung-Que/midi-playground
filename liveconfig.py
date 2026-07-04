@@ -6,7 +6,7 @@ from utils import CameraFollow, get_camera_follow, get_font
 
 
 class LiveConfigOverlay:
-    """Small non-blocking settings panel used while a song keeps playing."""
+    """Wide, non-blocking keyboard and mouse settings panel."""
 
     OPTIONS = (
         ("Theme / map colors", "theme"),
@@ -16,6 +16,10 @@ class LiveConfigOverlay:
         ("Colored pegs", "do_color_bounce_pegs"),
         ("Square glow", "square_glow"),
         ("Glow intensity", "glow_intensity"),
+        ("Directional edge", "square_edge_highlight"),
+        ("Outer border", "square_body_border_width"),
+        ("Corner radius", "square_body_corner_radius"),
+        ("Border bounce pulse", "square_border_pulse_strength"),
         ("Core shape", "square_core_shape"),
         ("Core fill", "square_core_color"),
         ("Core outline", "square_core_outline_color"),
@@ -35,7 +39,9 @@ class LiveConfigOverlay:
         ("Recording countdown", "shorts_countdown"),
         ("Map retention", "map_retention_seconds"),
         ("Map reveal fade", "map_fade_seconds"),
-        ("Visible peg cap", "peg_visible_max"),
+        ("Minimum future pegs", "peg_visible_min"),
+        ("Maximum future pegs", "peg_visible_max"),
+        ("Peg preview time", "peg_preview_seconds"),
         ("Past peg fade", "peg_past_fade_seconds"),
         ("Peg visual spacing", "peg_overlap_padding"),
         ("Next peg guide", "peg_guide_line"),
@@ -49,12 +55,14 @@ class LiveConfigOverlay:
         self.active = False
         self.selected = 0
         self.preview_square = Square(0, 0, 1, 1)
+        self.row_hitboxes: dict[int, pygame.Rect] = {}
+        self.minus_hitboxes: dict[int, pygame.Rect] = {}
+        self.plus_hitboxes: dict[int, pygame.Rect] = {}
+        self.panel_rect = pygame.Rect(0, 0, 0, 0)
+        self.page_capacity = 1
 
     def handle_event(self, event: pygame.event.Event, game) -> bool:
-        if event.type != pygame.KEYDOWN:
-            return False
-
-        if event.key == pygame.K_F10 and game.active:
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F10 and game.active:
             self.active = not self.active
             if not self.active:
                 save_to_file()
@@ -63,21 +71,68 @@ class LiveConfigOverlay:
         if not self.active:
             return False
 
-        if event.key == pygame.K_ESCAPE:
-            self.active = False
-            save_to_file()
+        if event.type == pygame.MOUSEMOTION:
+            for index, rect in self.row_hitboxes.items():
+                if rect.collidepoint(event.pos):
+                    self.selected = index
+                    break
             return True
-        if event.key == pygame.K_UP:
-            self.selected = (self.selected - 1) % len(self.OPTIONS)
+
+        if event.type == pygame.MOUSEWHEEL:
+            step = -1 if event.y > 0 else 1
+            self.selected = (self.selected + step) % len(self.OPTIONS)
             return True
-        if event.key == pygame.K_DOWN:
-            self.selected = (self.selected + 1) % len(self.OPTIONS)
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button in (4, 5):
+                step = -1 if event.button == 4 else 1
+                self.selected = (self.selected + step) % len(self.OPTIONS)
+                return True
+            for index, rect in self.row_hitboxes.items():
+                if not rect.collidepoint(event.pos):
+                    continue
+                self.selected = index
+                if event.button == 1 and self.minus_hitboxes[index].collidepoint(event.pos):
+                    self._adjust(self.OPTIONS[index][1], -1, game)
+                elif event.button == 1 and self.plus_hitboxes[index].collidepoint(event.pos):
+                    self._adjust(self.OPTIONS[index][1], 1, game)
+                elif event.button == 3:
+                    self._adjust(self.OPTIONS[index][1], -1, game)
+                return True
             return True
-        if event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_SPACE):
-            direction = -1 if event.key == pygame.K_LEFT else 1
-            self._adjust(self.OPTIONS[self.selected][1], direction, game)
+
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.active = False
+                save_to_file()
+                return True
+            if event.key == pygame.K_UP:
+                self.selected = (self.selected - 1) % len(self.OPTIONS)
+                return True
+            if event.key == pygame.K_DOWN:
+                self.selected = (self.selected + 1) % len(self.OPTIONS)
+                return True
+            if event.key == pygame.K_PAGEUP:
+                self.selected = max(0, self.selected - self.page_capacity)
+                return True
+            if event.key == pygame.K_PAGEDOWN:
+                self.selected = min(len(self.OPTIONS) - 1, self.selected + self.page_capacity)
+                return True
+            if event.key == pygame.K_HOME:
+                self.selected = 0
+                return True
+            if event.key == pygame.K_END:
+                self.selected = len(self.OPTIONS) - 1
+                return True
+            if event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_RETURN, pygame.K_SPACE):
+                direction = -1 if event.key == pygame.K_LEFT else 1
+                self._adjust(self.OPTIONS[self.selected][1], direction, game)
+                return True
             return True
-        return True
+        return event.type in {
+            pygame.MOUSEBUTTONUP,
+            pygame.MOUSEMOTION,
+        }
 
     @staticmethod
     def _adjust(name: str, direction: int, game):
@@ -92,10 +147,23 @@ class LiveConfigOverlay:
         elif name in {
             "bounce_effect", "do_particles_on_bounce", "particle_trail",
             "do_color_bounce_pegs", "square_glow", "performance_hud", "peg_guide_line",
+            "square_edge_highlight",
         }:
             setattr(Config, name, not bool(getattr(Config, name)))
         elif name == "glow_intensity":
             Config.glow_intensity = max(1, min(40, int(Config.glow_intensity) + direction))
+        elif name == "square_body_border_width":
+            Config.square_body_border_width = max(
+                1, min(8, int(Config.square_body_border_width) + direction)
+            )
+        elif name == "square_body_corner_radius":
+            Config.square_body_corner_radius = max(
+                0, min(16, int(Config.square_body_corner_radius) + direction)
+            )
+        elif name == "square_border_pulse_strength":
+            Config.square_border_pulse_strength = max(
+                0.0, min(1.0, round(float(Config.square_border_pulse_strength) + direction * 0.05, 2))
+            )
         elif name == "square_core_shape":
             shapes = Config.square_core_shapes
             current = Config.square_core_shape if Config.square_core_shape in shapes else shapes[0]
@@ -143,9 +211,20 @@ class LiveConfigOverlay:
             Config.map_retention_seconds = max(1, min(30, int(Config.map_retention_seconds) + direction))
         elif name == "map_fade_seconds":
             Config.map_fade_seconds = max(0.0, min(2.0, round(float(Config.map_fade_seconds) + direction * 0.05, 2)))
+        elif name == "peg_visible_min":
+            Config.peg_visible_min = max(
+                1, min(20, int(Config.peg_visible_min) + direction)
+            )
+            Config.peg_visible_max = max(
+                int(Config.peg_visible_min), int(Config.peg_visible_max)
+            )
         elif name == "peg_visible_max":
             Config.peg_visible_max = max(
-                int(Config.peg_visible_min), min(10, int(Config.peg_visible_max) + direction)
+                int(Config.peg_visible_min), min(20, int(Config.peg_visible_max) + direction)
+            )
+        elif name == "peg_preview_seconds":
+            Config.peg_preview_seconds = max(
+                0.1, min(5.0, round(float(Config.peg_preview_seconds) + direction * 0.1, 1))
             )
         elif name == "peg_past_fade_seconds":
             Config.peg_past_fade_seconds = max(
@@ -193,12 +272,18 @@ class LiveConfigOverlay:
             return f"{int(value)} deg/s"
         if name == "square_core_pulse_strength":
             return f"{float(value) * 100:.0f}%"
+        if name in {"square_body_border_width", "square_body_corner_radius"}:
+            return f"{int(value)}px"
+        if name == "square_border_pulse_strength":
+            return f"{float(value) * 100:.0f}%"
         if name == "map_retention_seconds":
             return f"{value}s"
         if name == "map_fade_seconds":
             return f"{float(value):.2f}s"
-        if name == "peg_visible_max":
+        if name in {"peg_visible_min", "peg_visible_max"}:
             return str(int(value))
+        if name == "peg_preview_seconds":
+            return f"{float(value):.1f}s"
         if name == "peg_past_fade_seconds":
             return f"{float(value):.1f}s"
         if name == "peg_overlap_padding":
@@ -216,21 +301,28 @@ class LiveConfigOverlay:
             self.active = False
             return
 
-        if not (Config.shorts_mode and Config.shorts_clean_ui and not self.active):
+        if not self.active and not (Config.shorts_mode and Config.shorts_clean_ui):
             hint = get_font(18).render("F10: live settings", True, (255, 255, 255))
             screen.blit(hint, hint.get_rect(topright=(Config.SCREEN_WIDTH - 15, 15)))
         if not self.active:
             return
 
-        width = min(620, Config.SCREEN_WIDTH - 40)
-        height = min(600, Config.SCREEN_HEIGHT - 40)
+        screen_width, screen_height = screen.get_size()
+        width = max(320, min(1180, screen_width - 24))
+        height = max(300, min(820, screen_height - 24))
+        self.panel_rect = pygame.Rect(0, 0, width, height)
+        self.panel_rect.center = screen.get_rect().center
         panel = pygame.Surface((width, height), pygame.SRCALPHA)
-        panel.fill((10, 12, 18, 225))
+        panel.fill((10, 12, 18, 238))
         pygame.draw.rect(panel, get_colors()["hallway"], panel.get_rect(), width=3, border_radius=8)
 
         title = get_font(30).render("Live Settings", True, (255, 255, 255))
         panel.blit(title, (24, 18))
-        help_text = get_font(16).render("Up/Down select  Left/Right change  F10/Esc close", True, (190, 195, 205))
+        help_text = get_font(16).render(
+            "Mouse +/- change  Wheel or Up/Down select  Left/Right change  F10/Esc close",
+            True,
+            (190, 195, 205),
+        )
         panel.blit(help_text, (24, 58))
 
         preview_rect = pygame.Rect(width - 84, 10, 64, 64)
@@ -240,21 +332,58 @@ class LiveConfigOverlay:
             self.preview_square.start_bounce()
         self.preview_square.draw(panel, preview_rect.inflate(-12, -12))
 
-        row_height = 28
-        visible_rows = max(1, (height - 104) // row_height)
-        start = max(0, min(
-            self.selected - visible_rows // 2,
-            len(self.OPTIONS) - visible_rows,
-        ))
-        for display_index, index in enumerate(range(start, min(start + visible_rows, len(self.OPTIONS)))):
-            label, name = self.OPTIONS[index]
-            y = 94 + display_index * row_height
-            if index == self.selected:
-                pygame.draw.rect(panel, (60, 75, 95, 220), (14, y - 3, width - 28, 28), border_radius=5)
-            color = (255, 255, 255) if index == self.selected else (210, 214, 222)
-            label_surface = get_font(18).render(label, True, color)
-            value_surface = get_font(18).render(self._value(name), True, color)
-            panel.blit(label_surface, (26, y))
-            panel.blit(value_surface, value_surface.get_rect(topright=(width - 26, y)))
+        row_top = 94
+        footer_height = 38
+        row_height = 32
+        columns = 2 if width >= 1000 else 1
+        visible_rows = max(1, (height - row_top - footer_height) // row_height)
+        self.page_capacity = max(visible_rows * columns, 1)
+        page = self.selected // self.page_capacity
+        start = page * self.page_capacity
+        end = min(start + self.page_capacity, len(self.OPTIONS))
+        column_width = (width - 28) // columns
 
-        screen.blit(panel, panel.get_rect(center=screen.get_rect().center))
+        self.row_hitboxes.clear()
+        self.minus_hitboxes.clear()
+        self.plus_hitboxes.clear()
+
+        for display_index, index in enumerate(range(start, end)):
+            label, name = self.OPTIONS[index]
+            column = display_index // visible_rows
+            row = display_index % visible_rows
+            x = 14 + column * column_width
+            y = row_top + row * row_height
+            row_rect = pygame.Rect(x, y - 2, column_width - 8, row_height - 2)
+            minus_rect = pygame.Rect(row_rect.right - 180, y + 1, 26, 24)
+            plus_rect = pygame.Rect(row_rect.right - 30, y + 1, 26, 24)
+            value_rect = pygame.Rect(minus_rect.right + 4, y + 1, plus_rect.left - minus_rect.right - 8, 24)
+
+            screen_offset = self.panel_rect.topleft
+            self.row_hitboxes[index] = row_rect.move(*screen_offset)
+            self.minus_hitboxes[index] = minus_rect.move(*screen_offset)
+            self.plus_hitboxes[index] = plus_rect.move(*screen_offset)
+
+            if index == self.selected:
+                pygame.draw.rect(panel, (60, 75, 95, 225), row_rect, border_radius=5)
+            color = (255, 255, 255) if index == self.selected else (210, 214, 222)
+            label_surface = get_font(17).render(label, True, color)
+            value_surface = get_font(16).render(self._value(name), True, color)
+            minus_surface = get_font(19).render("-", True, color)
+            plus_surface = get_font(19).render("+", True, color)
+            panel.blit(label_surface, label_surface.get_rect(midleft=(row_rect.left + 10, row_rect.centery)))
+            pygame.draw.rect(panel, (32, 39, 51), minus_rect, border_radius=5)
+            pygame.draw.rect(panel, (32, 39, 51), plus_rect, border_radius=5)
+            pygame.draw.rect(panel, (88, 101, 124), minus_rect, width=1, border_radius=5)
+            pygame.draw.rect(panel, (88, 101, 124), plus_rect, width=1, border_radius=5)
+            panel.blit(minus_surface, minus_surface.get_rect(center=minus_rect.center))
+            panel.blit(plus_surface, plus_surface.get_rect(center=plus_rect.center))
+            panel.blit(value_surface, value_surface.get_rect(center=value_rect.center))
+
+        page_count = max(1, (len(self.OPTIONS) + self.page_capacity - 1) // self.page_capacity)
+        footer = get_font(15).render(
+            f"Page {page + 1}/{page_count}  |  Right-click a row to decrease  |  Home/End and Page Up/Down supported",
+            True,
+            (155, 164, 180),
+        )
+        panel.blit(footer, footer.get_rect(midbottom=(width // 2, height - 10)))
+        screen.blit(panel, self.panel_rect)

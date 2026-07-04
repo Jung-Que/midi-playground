@@ -6,7 +6,7 @@ from utils import *
 import pygame
 from pygame import Color
 from bounce import Bounce
-from math import cos, pi, sin
+from math import cos, exp, pi, sin
 from pathlib import Path
 
 
@@ -22,6 +22,7 @@ class Square:
         self.time_since_glow_start = 0
         self.glowy_surfaces = {}
         self.custom_core_images = {}
+        self.visual_accent = None
 
     def register_past_color(self, col: tuple[int, int, int]):
         for _ in range(max(Config.square_swipe_anim_speed, 1)):
@@ -41,6 +42,7 @@ class Square:
         new = Square(*self.pos, *self.dir)
         new.last_bounce_time = self.last_bounce_time
         new.latest_bounce_direction = self.latest_bounce_direction
+        new.visual_accent = pygame.Color(self.visual_accent) if self.visual_accent is not None else None
         return new
 
     @property
@@ -110,6 +112,16 @@ class Square:
         palette = get_colors()["square"]
         square_color_index = round((self.dir_x + 1) / 2 + self.dir_y + 1)
         return pygame.Color(palette[square_color_index % len(palette)])
+
+    def rendered_accent_color(self):
+        """Ease palette changes so a bounce does not produce a one-frame colour cut."""
+        target = self.accent_color()
+        if self.visual_accent is None:
+            self.visual_accent = pygame.Color(target)
+            return pygame.Color(target)
+        alpha = 1.0 - exp(-max(float(Config.dt), 0.0) / 0.10)
+        self.visual_accent = pygame.Color(self.visual_accent).lerp(target, max(0.0, min(alpha, 1.0)))
+        return pygame.Color(self.visual_accent)
 
     @staticmethod
     def _configured_color(value, accent: pygame.Color) -> pygame.Color:
@@ -280,42 +292,49 @@ class Square:
         return image
 
     def _draw_neon_core(self, screen: pygame.Surface, sqrect: pygame.Rect):
-        accent = self.accent_color()
+        accent = self.rendered_accent_color()
         background = pygame.Color(get_colors()["background"])
         core = background.lerp(pygame.Color(5, 7, 10), 0.45)
-        border_radius = max(2, min(sqrect.width, sqrect.height) // 7)
-
-        pygame.draw.rect(screen, accent, sqrect, border_radius=border_radius)
-        inner = sqrect.inflate(-6, -6)
-        if inner.width > 0 and inner.height > 0:
-            pygame.draw.rect(screen, core, inner, border_radius=max(border_radius - 2, 1))
-
-        edge_color = accent.lerp(pygame.Color(255, 255, 255), 0.45)
-        edge_width = max(2, int(min(sqrect.width, sqrect.height) * 0.08))
-        if self.dir_x > 0:
-            pygame.draw.line(screen, edge_color, sqrect.topright, sqrect.bottomright, edge_width)
-        elif self.dir_x < 0:
-            pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.bottomleft, edge_width)
-        if self.dir_y > 0:
-            pygame.draw.line(screen, edge_color, sqrect.bottomleft, sqrect.bottomright, edge_width)
-        elif self.dir_y < 0:
-            pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.topright, edge_width)
-
-        center_x = sqrect.centerx + int(self.dir_x * sqrect.width * 0.08)
-        center_y = sqrect.centery + int(self.dir_y * sqrect.height * 0.08)
-        self._draw_custom_core(screen, sqrect, (center_x, center_y), accent)
+        border_radius = max(
+            0,
+            min(int(Config.square_body_corner_radius), min(sqrect.width, sqrect.height) // 2),
+        )
+        border_width = max(
+            1,
+            min(int(Config.square_body_border_width), max(1, min(sqrect.width, sqrect.height) // 4)),
+        )
 
         bounce_age = (pygame.time.get_ticks() - self.time_since_glow_start) / 1000
-        if 0 <= bounce_age < 0.15:
-            flash = 1.0 - bounce_age / 0.15
-            flash_color = accent.lerp(pygame.Color(255, 255, 255), flash)
-            width = max(2, int(5 * flash))
-            if self.latest_bounce_direction == 0:
-                x = sqrect.left if self.dir_x > 0 else sqrect.right
-                pygame.draw.line(screen, flash_color, (x, sqrect.top), (x, sqrect.bottom), width)
-            else:
-                y = sqrect.top if self.dir_y > 0 else sqrect.bottom
-                pygame.draw.line(screen, flash_color, (sqrect.left, y), (sqrect.right, y), width)
+        if 0 <= bounce_age < 0.14:
+            pulse = (1.0 - bounce_age / 0.14) ** 2
+            amount = max(0.0, min(float(Config.square_border_pulse_strength), 1.0)) * pulse
+            border_color = accent.lerp(pygame.Color(255, 255, 255), amount)
+        else:
+            border_color = accent
+
+        pygame.draw.rect(screen, border_color, sqrect, border_radius=border_radius)
+        inner = sqrect.inflate(-border_width * 2, -border_width * 2)
+        if inner.width > 0 and inner.height > 0:
+            pygame.draw.rect(screen, core, inner, border_radius=max(border_radius - border_width, 0))
+
+        if Config.square_edge_highlight:
+            edge_color = accent.lerp(pygame.Color(255, 255, 255), 0.30)
+            edge_width = max(1, min(border_width, 3))
+            inset = edge_width // 2
+            left = sqrect.left + inset
+            right = sqrect.right - 1 - inset
+            top = sqrect.top + inset
+            bottom = sqrect.bottom - 1 - inset
+            if self.dir_x > 0:
+                pygame.draw.line(screen, edge_color, (right, top), (right, bottom), edge_width)
+            elif self.dir_x < 0:
+                pygame.draw.line(screen, edge_color, (left, top), (left, bottom), edge_width)
+            if self.dir_y > 0:
+                pygame.draw.line(screen, edge_color, (left, bottom), (right, bottom), edge_width)
+            elif self.dir_y < 0:
+                pygame.draw.line(screen, edge_color, (left, top), (right, top), edge_width)
+
+        self._draw_custom_core(screen, sqrect, sqrect.center, accent)
 
     def draw(self, screen: pygame.Surface, sqrect: pygame.Rect):
         if self.died:

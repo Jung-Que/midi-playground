@@ -56,9 +56,12 @@ from streaming import (
     MapChunk,
     PlaylistController,
     PreparedMap,
+    _WorkerMapSession,
+    _segments_cross,
     map_settings_snapshot,
     prepare_song_map,
     read_song_audio,
+    rolling_map_policy,
     song_to_spec,
 )
 from utils import CameraFollow, get_camera_follow
@@ -84,6 +87,9 @@ class StreamingTests(unittest.TestCase):
             "square_core_color": "not-a-color",
             "performance_hud": "yes",
             "shorts_segment_duration": 42,
+            "peg_visible_min": 10,
+            "peg_visible_max": 2,
+            "peg_preview_seconds": 99,
             "unexpected": "ignored",
         })
 
@@ -94,6 +100,9 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(clean["square_core_color"], "accent")
         self.assertTrue(clean["performance_hud"])
         self.assertEqual(clean["shorts_segment_duration"], 30)
+        self.assertEqual(clean["peg_visible_min"], 10)
+        self.assertEqual(clean["peg_visible_max"], 10)
+        self.assertEqual(clean["peg_preview_seconds"], 5.0)
         self.assertNotIn("unexpected", clean)
         self.assertGreaterEqual(len(corrections), 7)
 
@@ -384,6 +393,77 @@ class StreamingTests(unittest.TestCase):
             Config.map_chunk_seconds = previous_chunk
             Config.map_stream_buffer_chunks = previous_buffer
 
+    def test_first_track_stream_survives_multi_song_prefetch(self):
+        previous_max_notes = Config.max_notes
+        previous_chunk = Config.map_chunk_seconds
+        previous_buffer = Config.map_stream_buffer_chunks
+        Config.max_notes = 128
+        Config.map_chunk_seconds = 1
+        Config.map_stream_buffer_chunks = 2
+        screen = pygame.display.get_surface()
+        Config.screen = screen
+        songs = [
+            make_song_from_zip("songs/bad-piggies.zip"),
+            make_song_from_zip("songs/tetris.zip"),
+            make_song_from_zip("songs/wii_theme.zip"),
+        ]
+        game = Game()
+        game.active = True
+        try:
+            self.assertIsNone(game.start_playlist(songs, 0, screen))
+            current = game.active_map_stream
+            self.assertIsNotNone(current)
+            self.assertIs(game.playlist.active_slot, current)
+            self.assertEqual(len(game.playlist.slots), 2)
+            self.assertFalse(current.error)
+
+            chunks_seen = 1
+            deadline = monotonic() + 30
+            while not game.playlist.stream_drained(current) and monotonic() < deadline:
+                chunks_seen += len(game.playlist.claim_chunks_until(current, float("inf")))
+                sleep(0.01)
+            chunks_seen += len(game.playlist.claim_chunks_until(current, float("inf")))
+
+            self.assertTrue(game.playlist.stream_drained(current))
+            self.assertTrue(current.map_complete)
+            self.assertFalse(current.map_inflight)
+            self.assertFalse(current.error)
+            self.assertGreater(chunks_seen, 2)
+            self.assertIs(game.active_map_stream, current)
+        finally:
+            game.shutdown()
+            Config.max_notes = previous_max_notes
+            Config.map_chunk_seconds = previous_chunk
+            Config.map_stream_buffer_chunks = previous_buffer
+
+    def test_prepare_next_song_preserves_existing_active_slot(self):
+        class FakePlaylist:
+            def __init__(self):
+                self.active_slot = object()
+                self.slots = []
+                self.calls = []
+
+            def ensure_prefetch(self, *_args):
+                self.calls.append("ensure_prefetch")
+
+            def prepare_ahead(self, *_args):
+                self.calls.append("prepare_ahead")
+
+            @staticmethod
+            def shutdown():
+                return None
+
+        game = Game()
+        game.playlist.shutdown()
+        fake = FakePlaylist()
+        game.playlist = fake
+        game.auto_advance = True
+        try:
+            game._prepare_next_song()
+            self.assertEqual(fake.calls, ["ensure_prefetch"])
+        finally:
+            game.shutdown()
+
     def test_streamed_bounces_keep_the_initial_schedule_offset(self):
         initial = ([100.0, 100.0], [1, -1], 14.0, 1)
         streamed = ([200.0, 200.0], [-1, -1], 15.0, 0)
@@ -412,9 +492,163 @@ class StreamingTests(unittest.TestCase):
             schedule = [bounce.time for bounce in game.world.future_bounces]
             self.assertEqual(schedule, [17.0, 18.0])
             self.assertEqual(schedule, sorted(schedule))
+            for _ in range(4):
+                # Adaptive rolling windows can be as short as four seconds at
+                # high speed, so evaluate inside the collision interval rather
+                # than relying on the former fixed 30-second preload window.
+                game._refresh_map_window(14.0, force=True)
+                if len(game.world.collision_times) == 2:
+                    break
             self.assertEqual(game.world.collision_times, [14.0, 15.0])
         finally:
             game.shutdown()
+
+    def test_rolling_map_policy_shrinks_time_windows_at_high_speed(self):
+        base = {
+            "SCREEN_WIDTH": 1920,
+            "SCREEN_HEIGHT": 1080,
+            "map_preload_seconds": 30,
+            "map_retention_seconds": 10,
+            "map_chunk_seconds": 15,
+            "map_stream_buffer_chunks": 8,
+        }
+        slow = rolling_map_policy({**base, "square_speed": 300})
+        fast = rolling_map_policy({**base, "square_speed": 1200})
+
+        self.assertLess(fast.preload_seconds, slow.preload_seconds)
+        self.assertLess(fast.retention_seconds, slow.retention_seconds)
+        self.assertLess(fast.chunk_seconds, slow.chunk_seconds)
+        self.assertGreaterEqual(fast.preload_distance, fast.screen_diagonal * 4)
+        self.assertLessEqual(fast.buffer_chunks, base["map_stream_buffer_chunks"])
+
+    def test_fast_song_path_planning_looks_further_ahead(self):
+        settings = map_settings_snapshot()
+        previous = {name: getattr(Config, name) for name in settings}
+        settings.update({
+            "bounce_min_spacing": 5,
+            "map_path_lookahead_bounces": 8,
+            "map_path_fast_lookahead_bounces": 16,
+            "map_path_fast_interval_seconds": 0.16,
+        })
+        try:
+            fast = _WorkerMapSession(
+                [index * 0.1 for index in range(20)], settings, [0.0, 0.0], [1, 1]
+            )
+            slow = _WorkerMapSession(
+                [float(index) for index in range(20)], settings, [0.0, 0.0], [1, 1]
+            )
+
+            self.assertEqual(fast._lookahead_depth(), 16)
+            self.assertEqual(slow._lookahead_depth(), 8)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_legacy_peg_display_settings_migrate_to_larger_preview(self):
+        clean, corrections = sanitize_settings({"peg_visible_max": 5})
+
+        self.assertEqual(clean["peg_visible_min"], 5)
+        self.assertEqual(clean["peg_visible_max"], 8)
+        self.assertEqual(clean["peg_preview_seconds"], 1.2)
+        self.assertTrue(any("peg display defaults migrated" in item for item in corrections))
+
+    def test_path_planner_avoids_a_collision_two_bounces_ahead(self):
+        settings = map_settings_snapshot()
+        previous = {name: getattr(Config, name) for name in settings}
+        settings.update({
+            "seed": 1,
+            "bounce_min_spacing": 5,
+            "square_speed": 100,
+            "direction_change_chance": 0,
+            "map_path_lookahead_bounces": 2,
+            "map_path_fast_lookahead_bounces": 2,
+            "map_path_beam_width": 4,
+            "map_path_commit_bounces": 1,
+            "map_path_clearance_pixels": 0,
+        })
+        try:
+            session = _WorkerMapSession([1.0, 2.0], settings, [0.0, 0.0], [1, 1])
+
+            # Axis 0 is the deterministic preferred first choice. Both of its
+            # second-bounce exits are blocked, while choosing axis 1 first is open.
+            trapped_position = [0.0, 200.0]
+            session.collision_index.insert(
+                "axis-0-exit",
+                Bounce(trapped_position, [1, 1], 2.0, 0).get_collision_rect(),
+            )
+            session.collision_index.insert(
+                "axis-1-exit",
+                Bounce(trapped_position, [-1, -1], 2.0, 1).get_collision_rect(),
+            )
+
+            self.assertEqual(session.preferred_axes[0], 0)
+            self.assertEqual(session._plan_bounce_axes()[0], 1)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_path_planner_avoids_crossing_a_recent_route(self):
+        settings = map_settings_snapshot()
+        previous = {name: getattr(Config, name) for name in settings}
+        settings.update({
+            "seed": 1,
+            "bounce_min_spacing": 5,
+            "square_speed": 100,
+            "direction_change_chance": 0,
+            "map_path_lookahead_bounces": 2,
+            "map_path_fast_lookahead_bounces": 2,
+            "map_path_beam_width": 4,
+            "map_path_commit_bounces": 1,
+            "map_path_clearance_pixels": 0,
+            "map_path_crossing_penalty": 800.0,
+            "map_path_axis_run_penalty": 0.0,
+            "map_path_drift_penalty": 0.0,
+        })
+        try:
+            session = _WorkerMapSession([1.0, 2.0], settings, [0.0, 0.0], [1, 1])
+            recent_segment = ((0.0, 100.0), (100.0, 200.0))
+            session._remember_path_segment(0.0, recent_segment)
+
+            preferred_second_segment = ((100.0, 100.0), (0.0, 200.0))
+            alternate_second_segment = ((100.0, 100.0), (200.0, 0.0))
+            self.assertTrue(_segments_cross(preferred_second_segment, recent_segment))
+            self.assertFalse(_segments_cross(alternate_second_segment, recent_segment))
+            self.assertEqual(session.preferred_axes[0], 0)
+            self.assertEqual(session._plan_bounce_axes()[0], 1)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_runtime_map_materialization_respects_per_frame_record_budget(self):
+        previous_records = Config.map_materialize_max_records
+        previous_budget = Config.map_materialize_budget_ms
+        previous_preload = Config.map_preload_seconds
+        Config.map_materialize_max_records = 8
+        Config.map_materialize_budget_ms = 100
+        Config.map_preload_seconds = 30
+        bounces = [
+            ([float(index * 10), float(index * 10)], [1, 1], index * 0.05, index % 2)
+            for index in range(100)
+        ]
+        prepared = PreparedMap(
+            bounces=bounces,
+            unhit_notes=[bounce[2] for bounce in bounces],
+            start_pos=[0.0, 0.0],
+            start_dir=[1, 1],
+            chunks=[MapChunk(0, 15, bounces)],
+        )
+        game = Game()
+        try:
+            game.map_chunks = game._build_runtime_chunks(prepared)
+            game._refresh_map_window(0.0)
+            self.assertEqual(game.last_materialized_records, 8)
+            self.assertEqual(len(game.world.collision_times), 8)
+            self.assertFalse(game.map_chunks[0].materialized)
+        finally:
+            game.shutdown()
+            Config.map_materialize_max_records = previous_records
+            Config.map_materialize_budget_ms = previous_budget
+            Config.map_preload_seconds = previous_preload
 
     def test_world_does_not_stop_while_more_chunks_are_pending(self):
         game = Game()
@@ -557,6 +791,16 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(index.query(pygame.Rect(0, 0, 50, 50)), {"near"})
         index.remove("near")
         self.assertEqual(index.query(pygame.Rect(0, 0, 50, 50)), set())
+
+    def test_spatial_hash_handles_large_corridors_without_cell_explosion(self):
+        index = SpatialHash(cell_size=32, max_cells_per_rect=4)
+        corridor = pygame.Rect(-1000, -1000, 4000, 4000)
+        index.insert("corridor", corridor)
+
+        self.assertEqual(index.query(pygame.Rect(2500, 2500, 20, 20)), {"corridor"})
+        self.assertLessEqual(len(index._item_cells["corridor"]), 4)
+        index.remove("corridor")
+        self.assertEqual(index.query(pygame.Rect(0, 0, 20, 20)), set())
 
     def test_hour_long_chunk_window_keeps_geometry_bounded(self):
         previous_chunk = Config.map_chunk_seconds
@@ -1415,6 +1659,48 @@ class StreamingTests(unittest.TestCase):
             for name, value in previous.items():
                 setattr(Config, name, value)
 
+    def test_square_projection_rounds_float_position_only_once(self):
+        camera = Camera()
+        camera.x = 0.0
+        camera.y = 0.0
+        camera.zoom = 1.0
+
+        projected = camera.project_centered_rect([100.75, 80.25], 50)
+
+        self.assertEqual(projected, pygame.Rect(76, 55, 50, 50))
+
+    def test_clean_neon_border_never_draws_outside_square(self):
+        previous = {
+            "theme": Config.theme,
+            "square_glow": Config.square_glow,
+            "square_core_shape": Config.square_core_shape,
+            "square_edge_highlight": Config.square_edge_highlight,
+            "square_border_pulse_strength": Config.square_border_pulse_strength,
+            "square_body_border_width": Config.square_body_border_width,
+            "square_body_corner_radius": Config.square_body_corner_radius,
+        }
+        Config.theme = "dark"
+        Config.square_glow = False
+        Config.square_core_shape = "none"
+        Config.square_edge_highlight = False
+        Config.square_border_pulse_strength = 0
+        Config.square_body_border_width = 3
+        Config.square_body_corner_radius = 6
+        background = pygame.Color(3, 4, 5, 255)
+        canvas = pygame.Surface((140, 140), pygame.SRCALPHA)
+        canvas.fill(background)
+        square_rect = pygame.Rect(40, 40, 50, 50)
+
+        try:
+            Square(65, 65, 1, 1).draw(canvas, square_rect)
+            self.assertEqual(canvas.get_at((square_rect.right, square_rect.centery)), background)
+            self.assertEqual(canvas.get_at((square_rect.centerx, square_rect.bottom)), background)
+            self.assertEqual(canvas.get_at((square_rect.left - 1, square_rect.centery)), background)
+            self.assertEqual(canvas.get_at((square_rect.centerx, square_rect.top - 1)), background)
+        finally:
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
     def test_square_style_presets_round_trip_with_unicode_names(self):
         previous = snapshot_style()
         try:
@@ -1544,23 +1830,85 @@ class StreamingTests(unittest.TestCase):
                 setattr(Config, name, value)
 
     def test_live_overlay_changes_peg_readability_settings(self):
-        previous_max = Config.peg_visible_max
-        previous_spacing = Config.peg_overlap_padding
-        previous_guide = Config.peg_guide_line
+        names = (
+            "peg_visible_min", "peg_visible_max", "peg_preview_seconds",
+            "peg_overlap_padding", "peg_guide_line",
+        )
+        previous = {name: getattr(Config, name) for name in names}
         game = Game()
         try:
+            LiveConfigOverlay._adjust("peg_visible_min", 1, game)
             LiveConfigOverlay._adjust("peg_visible_max", -1, game)
+            LiveConfigOverlay._adjust("peg_preview_seconds", 1, game)
             LiveConfigOverlay._adjust("peg_overlap_padding", 1, game)
             LiveConfigOverlay._adjust("peg_guide_line", 1, game)
 
-            self.assertEqual(Config.peg_visible_max, max(Config.peg_visible_min, previous_max - 1))
-            self.assertEqual(Config.peg_overlap_padding, min(24, previous_spacing + 2))
-            self.assertEqual(Config.peg_guide_line, not previous_guide)
+            self.assertEqual(Config.peg_visible_min, min(20, previous["peg_visible_min"] + 1))
+            self.assertGreaterEqual(Config.peg_visible_max, Config.peg_visible_min)
+            self.assertEqual(
+                Config.peg_preview_seconds,
+                min(5.0, round(previous["peg_preview_seconds"] + 0.1, 1)),
+            )
+            self.assertEqual(Config.peg_overlap_padding, min(24, previous["peg_overlap_padding"] + 2))
+            self.assertEqual(Config.peg_guide_line, not previous["peg_guide_line"])
         finally:
             game.shutdown()
-            Config.peg_visible_max = previous_max
-            Config.peg_overlap_padding = previous_spacing
-            Config.peg_guide_line = previous_guide
+            for name, value in previous.items():
+                setattr(Config, name, value)
+
+    def test_live_overlay_wide_layout_supports_mouse_adjustment(self):
+        previous_preview = Config.peg_preview_seconds
+        Config.peg_preview_seconds = 1.2
+        game = Game()
+        game.active = True
+        overlay = LiveConfigOverlay()
+        overlay.active = True
+        screen = pygame.display.get_surface()
+        option_index = next(
+            index for index, (_, name) in enumerate(overlay.OPTIONS)
+            if name == "peg_preview_seconds"
+        )
+        overlay.selected = option_index
+        try:
+            overlay.draw(screen, game_active=True)
+            self.assertGreater(overlay.panel_rect.width, 620)
+            self.assertIn(option_index, overlay.plus_hitboxes)
+
+            consumed = overlay.handle_event(
+                pygame.event.Event(
+                    pygame.MOUSEBUTTONDOWN,
+                    button=1,
+                    pos=overlay.plus_hitboxes[option_index].center,
+                ),
+                game,
+            )
+
+            self.assertTrue(consumed)
+            self.assertEqual(Config.peg_preview_seconds, 1.3)
+        finally:
+            game.shutdown()
+            Config.peg_preview_seconds = previous_preview
+
+    def test_visible_map_keeps_at_least_five_readable_future_pegs(self):
+        names = ("peg_visible_min", "peg_visible_max", "peg_preview_seconds", "peg_overlap_padding")
+        previous = {name: getattr(Config, name) for name in names}
+        Config.peg_visible_min = 5
+        Config.peg_visible_max = 8
+        Config.peg_preview_seconds = 1.2
+        Config.peg_overlap_padding = 6
+        game = Game()
+        try:
+            game.world.rectangles = [pygame.Rect(index * 80, 0, 10, 20) for index in range(12)]
+            game.world.collision_times = [0.2 + index * 0.2 for index in range(12)]
+            game.world.colors = [(255, 255, 255)] * 12
+            geometry, _, _, future_limit = game._visible_map_records(0.0)
+
+            self.assertGreaterEqual(future_limit, 5)
+            self.assertGreaterEqual(len(geometry), 5)
+        finally:
+            game.shutdown()
+            for name, value in previous.items():
+                setattr(Config, name, value)
 
 
 if __name__ == "__main__":
