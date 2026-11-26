@@ -3,6 +3,19 @@ from square import Square
 from math import exp
 
 
+def _smooth_damp(current: float, target: float, velocity: float, smooth_time: float, max_speed: float, dt: float):
+    """Critically damped spring (no overshoot): position and velocity both stay continuous."""
+    omega = 2.0 / max(smooth_time, 0.001)
+    x = omega * dt
+    decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+    change = current - target
+    max_change = max_speed * smooth_time
+    change = max(-max_change, min(max_change, change))
+    temp = (velocity + omega * change) * dt
+    velocity = (velocity - omega * temp) * decay
+    return target + (change + temp) * decay, velocity
+
+
 class Camera:
     def __init__(self, x: int = 0, y: int = 0):
         self.x = x
@@ -13,6 +26,8 @@ class Camera:
         self.bx = 0
         self.by = 0
         self.zoom = 1.0
+        self.vx = 0.0
+        self.vy = 0.0
         self.locked_on_square = True
         self.lock_type: CameraFollow = get_camera_follow(Config.camera_mode)
 
@@ -100,16 +115,18 @@ class Camera:
         if lower_y <= upper_y:
             self.y = max(lower_y, min(upper_y, self.y))
 
-    def follow(self, square: Square, target=None):
+    def follow(self, square: Square, target=None, focus=None):
 
         if Config.shorts_mode:
             self._follow_shorts(square, target)
             return
-        self.zoom = 1.0
+        self.zoom = max(float(Config.camera_zoom), 0.1)  # 1.0 normally; live mode enlarges the playfield
+        zoom = self.zoom
 
         # square in center
         if self.lock_type == CameraFollow.Center:
-            self.pos = [square.x - Config.SCREEN_WIDTH / 2, square.y - Config.SCREEN_HEIGHT / 2]
+            self.pos = [square.x - Config.SCREEN_WIDTH / (2 * zoom),
+                        square.y - (Config.SCREEN_HEIGHT / 2 + float(Config.view_center_offset_y)) / zoom]
 
         # camera only follows if necessary
         if self.lock_type == CameraFollow.Lazy:
@@ -140,23 +157,23 @@ class Camera:
             self.y = self.y*(1-3*Config.dt)+self.by*3*Config.dt
 
         if self.lock_type == CameraFollow.TargetLead:
-            focus_x = square.x
-            focus_y = square.y
-            if target is not None:
+            # focus: the average of the upcoming route (moves continuously, unlike the next peg,
+            # which jumps at every bounce); falls back to leading toward the next peg
+            lead_x = lead_y = 0.0
+            if focus is not None:
+                lead_x, lead_y = focus[0] - square.x, focus[1] - square.y
+            elif target is not None:
                 lead_x = (target[0] - square.x) * float(Config.camera_target_lead)
                 lead_y = (target[1] - square.y) * float(Config.camera_target_lead)
-                max_x = Config.SCREEN_WIDTH * float(Config.camera_max_lead_ratio)
-                max_y = Config.SCREEN_HEIGHT * float(Config.camera_max_lead_ratio)
-                focus_x += max(-max_x, min(max_x, lead_x))
-                focus_y += max(-max_y, min(max_y, lead_y))
+            max_x = Config.SCREEN_WIDTH * float(Config.camera_max_lead_ratio) / zoom
+            max_y = Config.SCREEN_HEIGHT * float(Config.camera_max_lead_ratio) / zoom
+            focus_x = square.x + max(-max_x, min(max_x, lead_x))
+            focus_y = square.y + max(-max_y, min(max_y, lead_y))
 
-            desired_x = focus_x - Config.SCREEN_WIDTH / 2
-            desired_y = focus_y - Config.SCREEN_HEIGHT / 2
+            desired_x = focus_x - Config.SCREEN_WIDTH / (2 * zoom)
+            desired_y = focus_y - (Config.SCREEN_HEIGHT / 2 + float(Config.view_center_offset_y)) / zoom
             dt = max(float(Config.dt), 0.0)
             smoothing = max(float(Config.camera_smoothing_seconds), 0.001)
-            alpha = 1.0 - exp(-dt / smoothing)
-            max_step = max(float(Config.camera_max_speed), 1.0) * dt
-            step_x = max(-max_step, min(max_step, (desired_x - self.x) * alpha))
-            step_y = max(-max_step, min(max_step, (desired_y - self.y) * alpha))
-            self.x += step_x
-            self.y += step_y
+            max_speed = max(float(Config.camera_max_speed), 1.0)
+            self.x, self.vx = _smooth_damp(self.x, desired_x, self.vx, smoothing, max_speed, dt)
+            self.y, self.vy = _smooth_damp(self.y, desired_y, self.vy, smoothing, max_speed, dt)

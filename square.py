@@ -10,6 +10,12 @@ from math import cos, pi, sin
 from pathlib import Path
 
 
+def accent_for_direction(dx, dy) -> pygame.Color:
+    """The square's colour while it travels in (dx, dy); a peg it bounced off takes the colour it leaves with."""
+    palette = get_colors()["square"]
+    return pygame.Color(palette[round((dx + 1) / 2 + dy + 1) % len(palette)])
+
+
 class Square:
     def __init__(self, x: float = 0, y: float = 0, dx: int = 1, dy: int = 1):
         self.pos: list[float] = [x, y]
@@ -107,9 +113,7 @@ class Square:
             win.blit(surf, rect.move(-40, -40).topleft, special_flags=pygame.BLEND_RGBA_ADD)
 
     def accent_color(self):
-        palette = get_colors()["square"]
-        square_color_index = round((self.dir_x + 1) / 2 + self.dir_y + 1)
-        return pygame.Color(palette[square_color_index % len(palette)])
+        return accent_for_direction(self.dir_x, self.dir_y)
 
     @staticmethod
     def _configured_color(value, accent: pygame.Color) -> pygame.Color:
@@ -286,17 +290,24 @@ class Square:
         border_radius = max(2, min(sqrect.width, sqrect.height) // 7)
 
         pygame.draw.rect(screen, accent, sqrect, border_radius=border_radius)
-        inner = sqrect.inflate(-6, -6)
+        # frame: 3 px with the leading-edge lines; without them the frame itself carries the colour
+        frame = 3 if Config.square_edge_lines else max(3, round(min(sqrect.width, sqrect.height) * Config.square_frame_ratio))
+        inner = sqrect.inflate(-2 * frame, -2 * frame)
         if inner.width > 0 and inner.height > 0:
-            pygame.draw.rect(screen, core, inner, border_radius=max(border_radius - 2, 1))
+            pygame.draw.rect(screen, core, inner, border_radius=max(border_radius - frame + 1, 1))
 
         edge_color = accent.lerp(pygame.Color(255, 255, 255), 0.45)
         edge_width = max(2, int(min(sqrect.width, sqrect.height) * 0.08))
-        if self.dir_x > 0:
+        edges = bool(Config.square_edge_lines)  # bright leading-edge lines + bounce flash line
+        if not edges:
+            pass
+        elif self.dir_x > 0:
             pygame.draw.line(screen, edge_color, sqrect.topright, sqrect.bottomright, edge_width)
         elif self.dir_x < 0:
             pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.bottomleft, edge_width)
-        if self.dir_y > 0:
+        if not edges:
+            pass
+        elif self.dir_y > 0:
             pygame.draw.line(screen, edge_color, sqrect.bottomleft, sqrect.bottomright, edge_width)
         elif self.dir_y < 0:
             pygame.draw.line(screen, edge_color, sqrect.topleft, sqrect.topright, edge_width)
@@ -306,7 +317,7 @@ class Square:
         self._draw_custom_core(screen, sqrect, (center_x, center_y), accent)
 
         bounce_age = (pygame.time.get_ticks() - self.time_since_glow_start) / 1000
-        if 0 <= bounce_age < 0.15:
+        if edges and 0 <= bounce_age < 0.15:
             flash = 1.0 - bounce_age / 0.15
             flash_color = accent.lerp(pygame.Color(255, 255, 255), flash)
             width = max(2, int(5 * flash))

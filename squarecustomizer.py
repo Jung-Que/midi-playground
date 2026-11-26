@@ -23,7 +23,7 @@ STYLE_FIELDS = (
     "square_core_image_path",
 )
 DEFAULT_STYLE = {
-    "square_core_shape": "diamond",
+    "square_core_shape": "none",
     "square_core_color": "accent",
     "square_core_outline_color": "#FFFFFF",
     "square_core_scale": 0.42,

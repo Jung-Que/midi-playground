@@ -1,0 +1,67 @@
+{
+    "category": "marimba",
+    "video_id": "",
+    "chat_source": "auto",
+    "test_chat_file": "live_test_chat.txt",
+    "song_command": "!song",
+    "color_command": "!color",
+    "help_command": "!help",
+    "help_cooldown_seconds": 30,
+    "help_messages": [
+        "!song <title or number>  !color <theme>",
+        "Songs: {songs}",
+        "Themes: {themes}"
+    ],
+    "queue_size": 3,
+    "window_every_seconds": 60,
+    "window_open_seconds": 20,
+    "recent_song_memory": 3,
+    "themes": [
+        "dark_modern",
+        "dark",
+        "light",
+        "rainbow",
+        "autumn",
+        "winter",
+        "spring",
+        "magenta",
+        "monochromatic"
+    ],
+    "width": 1080,
+    "height": 1920,
+    "window_height": 0,
+    "zoom": 1.8,
+    "top_panel_ratio": 0.24,
+    "bottom_reserve_ratio": 0.16,
+    "font_file": "C:/Windows/Fonts/malgunbd.ttf",
+    "caption_seconds": 5,
+    "show_hud": false,
+    "game_settings": {
+        "theme": "dark_modern",
+        "square_speed": 500,
+        "do_color_bounce_pegs": true,
+        "square_glow": false,
+        "glow_intensity": 4,
+        "particle_amount": 10,
+        "square_core_shape": "note",
+        "square_core_outline_width": 0,
+        "performance_hud": false,
+        "square_edge_lines": false
+    },
+    "label_color": "#A5B9CD",
+    "texts": [],
+    "captions": [
+        "!song <title>      !color <theme>"
+    ],
+    "labels": {
+        "now": "Now",
+        "next": "Next",
+        "queue": "Queue",
+        "empty_slot": "Empty",
+        "auto_slot": "Auto",
+        "window_open": "Open {seconds}",
+        "window_closed": "Next input in {seconds}",
+        "color_vote": "Theme vote: {theme} {votes}",
+        "requested_by": "{user}"
+    }
+}

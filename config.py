@@ -143,7 +143,7 @@ class Config:
     # intended configurable settings
     SCREEN_WIDTH = pygame.display.Info().current_w if pygame.display.Info().current_w else 1920
     SCREEN_HEIGHT = pygame.display.Info().current_h if pygame.display.Info().current_h else 1080
-    theme: Optional[str] = "dark"
+    theme: Optional[str] = "dark_modern"
     seed: Optional[int] = None
     camera_mode: Optional[int] = 4
     start_playing_delay = 3000
@@ -165,20 +165,14 @@ class Config:
     map_retention_seconds = 5
     map_fade_seconds = 0.35
     peg_visible_min = 3
-    peg_visible_max = 6
-    peg_visible_past_max = 3
-    peg_density_window_seconds = 1.0
-    peg_preview_seconds = 0.5
-    peg_past_fade_seconds = 1.5
-    peg_overlap_padding = 8
-    peg_guide_line = True
-    peg_order_count = 3
+    peg_visible_max = 10  # upcoming pegs drawn ahead of the square
     peg_countdown_seconds = 0.6
     peg_impact_seconds = 0.18
     peg_impact_ring_seconds = 0.3
     camera_target_lead = 0.3
     camera_max_lead_ratio = 0.22
-    camera_smoothing_seconds = 0.2
+    camera_smoothing_seconds = 0.3  # spring time of the follow camera
+    camera_lookahead_seconds = 0.8  # camera frames the average of the square's next 0.8 s of route
     camera_max_speed = 2400
     square_afterimage_count = 4
     square_afterimage_seconds = 0.28
@@ -187,7 +181,7 @@ class Config:
     square_core_colors = (
         "accent", "#FFFFFF", "#FF4F91", "#55D9FF", "#FFD166", "#8D7CFF", "#69F0AE", "#FF7043"
     )
-    square_core_shape = "diamond"
+    square_core_shape = "none"
     square_core_color = "accent"
     square_core_outline_color = "#FFFFFF"
     square_core_scale = 0.42
@@ -200,13 +194,19 @@ class Config:
     particle_death_lifetime = 0.7
     map_view_margin = 2.0
     map_chunk_seconds = 15
-    map_preload_seconds = 30
+    map_preload_seconds = 60  # map loaded this far ahead; it is drawn as soon as it is off screen
     map_stream_buffer_chunks = 8
     spatial_cell_size = 256
     playlist_prefetch_count = 2
     transition_wait_timeout_seconds = 20
     audio_clock_max_probe_ms = 5000
     performance_hud = True
+    fps_limit = 60  # frame cap; a divisor of the monitor rate keeps frame pacing even (0 = monitor rate)
+    view_center_offset_y = 0.0  # px the followed square sits below the screen centre (live mode top panel)
+    camera_zoom = 1.0  # follow-camera scale (live mode: bigger square on a phone screen)
+    frame_time = None  # when the frame being drawn will be presented (FramePacer); None = now
+    square_edge_lines = False  # bright lines on the square's leading edges and at each bounce
+    square_frame_ratio = 0.12  # coloured frame width / square size when the edge lines are off
 
     # vertical creator / shorts mode
     shorts_mode = False
@@ -246,13 +246,13 @@ class Config:
                   "particle_trail", "shader_file_name", "do_color_bounce_pegs", 
                   "do_particles_on_bounce", "bounce_effect", "square_glow", "glow_intensity",
                   "particle_amount", "map_retention_seconds", "map_fade_seconds",
-                  "peg_visible_max", "peg_past_fade_seconds", "peg_overlap_padding", "peg_guide_line",
+                  "peg_visible_max",
                   "square_core_shape", "square_core_color", "square_core_outline_color",
                   "square_core_scale", "square_core_outline_width", "square_core_rotation_speed",
                   "square_core_pulse_strength", "square_core_image_path",
                   "shorts_mode", "shorts_clean_ui", "shorts_segment_start", "shorts_segment_duration",
                   "shorts_loop", "shorts_countdown", "shorts_title_overlay",
-                  "performance_hud", "language",
+                  "performance_hud", "fps_limit", "language", "square_edge_lines",
                   "SCREEN_WIDTH", "SCREEN_HEIGHT"]
 
     # glow effect, for dark_modern only for now
@@ -268,7 +268,7 @@ DEFAULT_SETTINGS = {name: getattr(Config, name) for name in Config.save_attrs}
 
 _BOOLEAN_SETTINGS = {
     "theatre_mode", "particle_trail", "do_color_bounce_pegs", "do_particles_on_bounce",
-    "bounce_effect", "square_glow", "peg_guide_line", "performance_hud",
+    "bounce_effect", "square_glow", "performance_hud", "square_edge_lines",
     "shorts_mode", "shorts_clean_ui", "shorts_loop", "shorts_countdown", "shorts_title_overlay",
 }
 _INTEGER_RANGES = {
@@ -283,18 +283,17 @@ _INTEGER_RANGES = {
     "particle_amount": (0, 50),
     "map_retention_seconds": (1, 60),
     "peg_visible_max": (1, 20),
-    "peg_overlap_padding": (0, 50),
     "square_core_outline_width": (0, 6),
     "square_core_rotation_speed": (-180, 180),
     "shorts_segment_start": (0, 86_400),
     "shorts_segment_duration": (15, 60),
+    "fps_limit": (0, 360),
     "SCREEN_WIDTH": (320, 7_680),
     "SCREEN_HEIGHT": (240, 4_320),
 }
 _FLOAT_RANGES = {
     "bounce_min_spacing": (5.0, 200.0),
     "map_fade_seconds": (0.0, 5.0),
-    "peg_past_fade_seconds": (0.0, 10.0),
     "square_core_scale": (0.2, 0.75),
     "square_core_pulse_strength": (0.0, 0.4),
 }

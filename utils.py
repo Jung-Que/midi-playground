@@ -5,7 +5,8 @@ from errors import *
 from config import Config, get_colors
 from translations import TRANSLATIONS
 # noinspection PyUnresolvedReferences
-from time import time as get_current_time
+from time import perf_counter as get_current_time  # monotonic, sub-microsecond
+from time import sleep
 import moderngl
 import mido
 import pygame
@@ -26,6 +27,8 @@ if platform == "win32":
         FRAMERATE = win32api.EnumDisplaySettings(win32api.EnumDisplayDevices().DeviceName, -1).DisplayFrequency
     except ModuleNotFoundError:
         print("The win32api python module is not found! Install it with \"pip install pywin32\"")
+        FRAMERATE = 60
+    except Exception:  # e.g. pywintypes.error in a background map-worker process: it never draws, 60 is fine
         FRAMERATE = 60
 elif "linux" in platform:
     # noinspection PyPackageRequirements
@@ -89,7 +92,8 @@ def read_osu_file(filedata: bytes):
 
 def surf_to_texture(in_surface: pygame.Surface) -> moderngl.Texture:
     tex = Config.ctx.texture(in_surface.get_size(), 4)
-    tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    smooth = getattr(Config, "texture_smooth", False)
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR) if smooth else (moderngl.NEAREST, moderngl.NEAREST)
     tex.swizzle = 'BGRA'
     tex.write(in_surface.get_view('1'))
     return tex
@@ -136,6 +140,62 @@ def read_midi_file(file):
             notes.append(round(timestamp*1000)/1000)
         current_time += msg.time
     return notes
+
+
+# (time in seconds, pitch or None, duration in seconds)
+MapNote = tuple[float, Optional[int], float]
+
+
+def read_midi_notes(file, skip_channels=()) -> list[MapNote]:
+    """Like read_midi_file, but keeps each onset's pitch and length. Simultaneous notes collapse to the highest one."""
+    open_notes: dict[tuple[int, int], list[float]] = {}
+    raw: list[list] = []  # [time, pitch, duration]
+    current_time = 0.0
+    for msg in mido.MidiFile(file=file):
+        current_time += msg.time
+        if getattr(msg, "channel", None) in skip_channels:
+            continue
+        if msg.type == "note_on" and msg.velocity != 0:
+            timestamp = round(current_time * 1000) / 1000
+            raw.append([timestamp, msg.note, 0.0])
+            open_notes.setdefault((msg.channel, msg.note), []).append(len(raw) - 1)
+        elif msg.type in ("note_off", "note_on"):
+            stack = open_notes.get((msg.channel, msg.note))
+            if stack:
+                index = stack.pop(0)
+                raw[index][2] = max(current_time - raw[index][0], 0.0)
+
+    notes: list[MapNote] = []
+    for timestamp, pitch, duration in raw:
+        if notes and notes[-1][0] == timestamp:
+            _, other_pitch, other_duration = notes[-1]
+            notes[-1] = (timestamp, max(pitch, other_pitch), max(duration, other_duration))
+        else:
+            notes.append((timestamp, pitch, duration))
+    return notes
+
+
+def thin_notes(notes: list[MapNote], threshold=30) -> list[MapNote]:
+    """remove_too_close_values for MapNotes, with ornaments resolved onto the note they lead into.
+
+    A note within `threshold` ms of the last kept note is normally dropped. But if the kept note is a short ornament
+    (it has stopped sounding by the time the next note starts and is shorter than the threshold), the later note takes
+    its place, so the peg lands on the main note's beat. A note that already replaced one is not replaced again,
+    so a trill thins out instead of sliding to its last note."""
+    threshold_seconds = threshold / 1000
+    kept: list[MapNote] = []
+    replaced_last = False
+    for note in notes:
+        if not kept or kept[-1][0] + threshold_seconds <= note[0]:
+            kept.append(note)
+            replaced_last = False
+            continue
+        last_time, _, last_duration = kept[-1]
+        is_ornament = 0 < last_duration < threshold_seconds and last_time + last_duration <= note[0] + 1e-6
+        if is_ornament and not replaced_last:
+            kept[-1] = note
+            replaced_last = True
+    return kept
 
 
 # remove values that are too close to each other
@@ -272,3 +332,94 @@ def interpolate_fn(n):
     n = min(max(n, 0), 1)
 
     return sin(pi * (n - 0.5)) / 2 + 0.5
+
+
+class FramePacer:
+    """Frames at exact 1/fps intervals, presented just before a display refresh.
+
+    pygame's Clock.tick waits whole milliseconds (60 fps comes out as ~61.3), which on a 180 Hz screen shows
+    some frames for 2 refreshes instead of 3: a visible hitch several times a second. Here each frame has a
+    present deadline on a fixed 1/fps grid; on Windows the deadline is snapped to the compositor's vblank so
+    every frame stays exactly N refreshes. Usage per frame: plan() -> draw (state for that time) -> wait() ->
+    flip; dt is the time between two presents.
+    """
+
+    PRESENT_MARGIN = 0.0025  # present this long before the refresh, so the compositor takes it for that refresh
+
+    def __init__(self):
+        self.target = None
+        self.dt = 1 / 60
+        self._dwm = None
+        self._freq = None
+        if platform == "win32":
+            try:
+                import ctypes
+                self._ctypes = ctypes
+                self._dwm = ctypes.windll.dwmapi
+                freq = ctypes.c_int64()
+                ctypes.windll.kernel32.QueryPerformanceFrequency(ctypes.byref(freq))
+                self._freq = float(freq.value)
+                self._info = _dwm_timing_info_type(ctypes)()
+            except Exception:
+                self._dwm = None
+
+    def _vblank_grid(self):
+        """(time of the last vblank, refresh period) in perf_counter seconds, or None."""
+        if self._dwm is None:
+            return None
+        info = self._info
+        info.cbSize = self._ctypes.sizeof(info)
+        if self._dwm.DwmGetCompositionTimingInfo(None, self._ctypes.byref(info)) != 0 or not info.qpcRefreshPeriod:
+            return None
+        return info.qpcVBlank / self._freq, info.qpcRefreshPeriod / self._freq
+
+    def plan(self, fps: float) -> float:
+        """Present time of the frame about to be drawn (draw the world as it is at this moment)."""
+        period = 1.0 / max(float(fps), 1.0)
+        now = get_current_time()
+        previous = self.target
+        target = previous + period if previous is not None else now + period
+        if target < now + 0.001:  # fell behind (a stall): restart the grid from now instead of rushing
+            target = now + period
+        grid = self._vblank_grid()
+        if grid is not None and abs(period / grid[1] - round(period / grid[1])) > 0.05:
+            grid = None
+        if grid is not None:
+            vblank, refresh = grid
+            n = round((target + self.PRESENT_MARGIN - vblank) / refresh)
+            snapped = vblank + n * refresh - self.PRESENT_MARGIN
+            if snapped < now + 0.001:
+                snapped += refresh * max(1, round(period / refresh))
+            target = snapped
+        self.dt = (target - previous) if previous is not None else period
+        self.target = target
+        return target
+
+    def wait(self):
+        """Sleep, then spin the last moment, until the planned present time."""
+        if self.target is None:
+            return
+        while True:
+            remaining = self.target - get_current_time()
+            if remaining <= 0:
+                return
+            if remaining > 0.002:
+                sleep(remaining - 0.0015)
+
+
+def _dwm_timing_info_type(ctypes):
+    u32, u64 = ctypes.c_uint32, ctypes.c_uint64
+    fields = [("cbSize", u32), ("rateRefreshNum", u32), ("rateRefreshDen", u32), ("qpcRefreshPeriod", u64),
+              ("rateComposeNum", u32), ("rateComposeDen", u32), ("qpcVBlank", u64), ("cRefresh", u64),
+              ("cDXRefresh", u32), ("qpcCompose", u64), ("cFrame", u64), ("cDXPresent", u32),
+              ("cRefreshFrame", u64), ("cFrameSubmitted", u64), ("cDXPresentSubmitted", u32),
+              ("cFrameConfirmed", u64), ("cDXPresentConfirmed", u32), ("cRefreshConfirmed", u64),
+              ("cDXRefreshConfirmed", u32), ("cFramesLate", u64), ("cFramesOutstanding", u32),
+              ("cFrameDisplayed", u64), ("qpcFrameDisplayed", u64), ("cRefreshFrameDisplayed", u64),
+              ("cFrameComplete", u64), ("qpcFrameComplete", u64), ("cFramePending", u64), ("qpcFramePending", u64),
+              ("cFramesDisplayed", u64), ("cFramesComplete", u64), ("cFramesPending", u64),
+              ("cFramesAvailable", u64), ("cFramesDropped", u64), ("cFramesMissed", u64),
+              ("cRefreshNextDisplayed", u64), ("cRefreshNextPresented", u64), ("cRefreshesDisplayed", u64),
+              ("cRefreshesPresented", u64), ("cRefreshStarted", u64), ("cPixelsReceived", u64),
+              ("cPixelsDrawn", u64), ("cBuffersEmpty", u64)]
+    return type("DWM_TIMING_INFO", (ctypes.Structure,), {"_pack_": 1, "_fields_": fields})

@@ -348,7 +348,7 @@ class ConfigPage:
                 self.s_do_particles_on_bounce.current_state.selected_option = "On"
                 self.s_do_particles_on_bounce.current_state.start()
 
-                Config.square_core_shape = "diamond"
+                Config.square_core_shape = "none"
                 Config.square_core_color = "accent"
                 Config.square_core_outline_color = "#FFFFFF"
                 Config.square_core_scale = 0.42

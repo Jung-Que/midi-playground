@@ -2,12 +2,11 @@ from utils import *
 from bounce import Bounce
 from particle import Particle
 from square import Square
-from time import time as get_current_time
+from time import perf_counter as get_current_time
 from scorekeeper import Scorekeeper
 import random
 import pygame
 from collections import deque
-from spatial import SpatialHash
 
 
 class World:
@@ -15,6 +14,7 @@ class World:
 
     def __init__(self):
         self.future_bounces = deque()
+        self.end_glide_until: Optional[float] = None  # after the last bounce, keep moving until this schedule time
         self.past_bounces: list[Bounce] = []
         self.completed_bounces = 0
         self.total_bounces = 0
@@ -31,8 +31,6 @@ class World:
         self.motion_anchor_time = 0.0
         self.scorekeeper = Scorekeeper(self)
         self.colors = []
-        self.geometry_index = SpatialHash(Config.spatial_cell_size)
-        self.safe_area_index = SpatialHash(Config.spatial_cell_size)
 
     def update_time(self) -> None:
         self.time = get_current_time() - self.start_time
@@ -47,19 +45,9 @@ class World:
         cutoff = self.time - retention_seconds
         self.past_bounces = [bounce for bounce in self.past_bounces if bounce.time >= cutoff]
 
-    def rebuild_spatial_indexes(self, safe_areas: list[pygame.Rect]):
-        self.geometry_index = SpatialHash(Config.spatial_cell_size)
-        self.safe_area_index = SpatialHash(Config.spatial_cell_size)
-        for index, rect in enumerate(self.rectangles):
-            self.geometry_index.insert(index, rect)
-        for index, rect in enumerate(safe_areas):
-            self.safe_area_index.insert(index, rect)
-
     def visible_geometry(self, world_view: pygame.Rect) -> list[int]:
-        return sorted(self.geometry_index.query(world_view))
-
-    def visible_safe_areas(self, world_view: pygame.Rect) -> list[int]:
-        return sorted(self.safe_area_index.query(world_view))
+        # one C-level pass; cheaper than keeping a spatial hash in step with a constantly pruned list
+        return world_view.collidelistall(self.rectangles)
 
     def add_bounce_particles(self, sp: list[float], sd: list[float], bounce_time: float = 0.0):
         local_rate = sum(
@@ -97,6 +85,8 @@ class World:
         if self.future_bounces:
             segment_seconds = max(self.future_bounces[0].time - self.motion_anchor_time, 0.0)
             elapsed = min(elapsed, segment_seconds)
+        elif self.end_glide_until is not None:
+            elapsed = min(elapsed, max(self.end_glide_until - self.motion_anchor_time, 0.0))
 
         square.pos = [
             self.motion_anchor_pos[axis]
@@ -104,6 +94,15 @@ class World:
             for axis in range(2)
         ]
         square.dir = self.motion_anchor_dir.copy()
+
+    def set_end_glide(self, square: Square, until: float):
+        """Let the square run on after the last bounce until `until`, where the next song's route picks it up."""
+        self.end_glide_until = float(until)
+        if not self.future_bounces and square.dir == [0, 0] and self.past_bounces:
+            last = self.past_bounces[-1]  # it had already stopped: resume from the last bounce
+            square.pos = last.square_pos.copy()
+            square.dir = last.square_dir.copy()
+            self.reset_motion_anchor(square, last.time)
 
     def handle_bouncing(self, square: Square):
         schedule_time = (self.time * 1000 + Config.music_offset) / 1000
@@ -121,8 +120,8 @@ class World:
             if Config.do_particles_on_bounce:
                 self.add_bounce_particles(square.pos, changed, current_bounce.time)
 
-            # stop square at end
-            if not self.future_bounces and self.map_stream_complete:
+            # stop square at end (unless it glides on into the next song's map)
+            if not self.future_bounces and self.map_stream_complete and self.end_glide_until is None:
                 square.dir = [0, 0]
                 square.pos = current_bounce.square_pos
                 self.reset_motion_anchor(square, current_bounce.time)
@@ -270,5 +269,5 @@ class World:
         self.collision_times = [_fb.time for _fb in self.future_bounces]
         
         # Setting random colors for the generated pegs
-        self.colors = [random.choice([(224, 50, 50), (80, 210, 100), (230, 220, 50), (174, 170, 210), (245, 77, 247), (255, 153, 0)]) for _ in self.future_bounces]
+        self.colors = [tuple(_fb.square_dir) for _fb in self.future_bounces]  # the square's colour after each bounce
         return safe_areas

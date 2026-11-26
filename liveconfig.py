@@ -36,9 +36,6 @@ class LiveConfigOverlay:
         ("Map retention", "map_retention_seconds"),
         ("Map reveal fade", "map_fade_seconds"),
         ("Visible peg cap", "peg_visible_max"),
-        ("Past peg fade", "peg_past_fade_seconds"),
-        ("Peg visual spacing", "peg_overlap_padding"),
-        ("Next peg guide", "peg_guide_line"),
         ("Performance HUD", "performance_hud"),
         ("Square speed (future)", "square_speed"),
         ("Bounce spacing (future)", "bounce_min_spacing"),
@@ -91,7 +88,7 @@ class LiveConfigOverlay:
                 game.stream_message = "Shorts mode will apply when the next song starts"
         elif name in {
             "bounce_effect", "do_particles_on_bounce", "particle_trail",
-            "do_color_bounce_pegs", "square_glow", "performance_hud", "peg_guide_line",
+            "do_color_bounce_pegs", "square_glow", "performance_hud",
         }:
             setattr(Config, name, not bool(getattr(Config, name)))
         elif name == "glow_intensity":
@@ -147,14 +144,6 @@ class LiveConfigOverlay:
             Config.peg_visible_max = max(
                 int(Config.peg_visible_min), min(10, int(Config.peg_visible_max) + direction)
             )
-        elif name == "peg_past_fade_seconds":
-            Config.peg_past_fade_seconds = max(
-                0.0, min(5.0, round(float(Config.peg_past_fade_seconds) + direction * 0.1, 1))
-            )
-        elif name == "peg_overlap_padding":
-            Config.peg_overlap_padding = max(
-                0, min(24, int(Config.peg_overlap_padding) + direction * 2)
-            )
         elif name == "square_speed":
             Config.square_speed = max(100, min(2000, int(Config.square_speed) + direction * 50))
             game.regenerate_future_map()
@@ -199,10 +188,6 @@ class LiveConfigOverlay:
             return f"{float(value):.2f}s"
         if name == "peg_visible_max":
             return str(int(value))
-        if name == "peg_past_fade_seconds":
-            return f"{float(value):.1f}s"
-        if name == "peg_overlap_padding":
-            return f"{int(value)}px"
         if name == "square_speed":
             return f"{value}px/s"
         if name == "bounce_min_spacing":

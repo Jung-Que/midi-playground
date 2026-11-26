@@ -228,7 +228,154 @@ def run_release_smoke_test() -> int:
     return 0
 
 
-def main():
+def update_rainbow_theme():
+    # thanks to TheCodingCrafter for the implementation
+    if Config.theme == "rainbow":
+        to_set_as_rainbow = pygame.Color((0, 0, 0))
+        to_set_as_rainbow2 = pygame.Color((0, 0, 0))
+        to_set_as_rainbow.hsva = (((pygame.time.get_ticks() / 1000) * Config.rainbow_speed) % 360, 100, 75, 100)
+        to_set_as_rainbow2.hsva = ((((pygame.time.get_ticks() / 1000) * Config.rainbow_speed) + 180) % 360, 100, 75, 100)
+        get_colors()["background"] = to_set_as_rainbow
+        get_colors()["hallway"] = to_set_as_rainbow2
+        get_colors()["square"][0] = to_set_as_rainbow
+
+
+def live_window_size(settings: dict) -> list[int]:
+    """The game renders at live width x height; the window shows it scaled to fit the monitor."""
+    height = int(settings["window_height"])
+    if height <= 0:  # 1280 (OBS 720x1280, 1:1) when it fits, else 90% of the monitor height (laptops)
+        sizes = pygame.display.get_desktop_sizes()
+        height = min(1280, int((sizes[0][1] if sizes else 1080) * 0.9))
+    return [max(round(height * settings["width"] / settings["height"]), 1), height]
+
+
+def run_live_loop(screen, glsl_program, render_object, clock, settings: dict, saved_size) -> None:
+    from live import LiveSession, LiveOverlay, LibraryWatcher, make_chat_source, view_center_offset
+    from paths import resource_path
+
+    local_dir = user_path("songs-local")
+    watcher = LibraryWatcher(
+        [local_dir, resource_path("songs")],
+        settings["category"],
+        lambda path: make_song_from_zip(path, local_only=Path(path).parent == local_dir),
+    )
+    songs = list(watcher.scan().values())  # packs added while live are picked up by watcher.poll()
+    saved = {
+        "theme": Config.theme,
+        "playlist_prefetch_count": Config.playlist_prefetch_count,
+        "view_center_offset_y": Config.view_center_offset_y,
+        "shorts_mode": Config.shorts_mode,
+        "camera_zoom": Config.camera_zoom,
+    }
+    Config.camera_zoom = max(float(settings["zoom"]), 0.1)
+    # the 30 s Shorts segment recorder (its own snapping camera, segment loop, no auto-advance) is not live mode
+    Config.shorts_mode = False
+    # live.json game_settings: the stream's look, the same on every PC (checked like settings.json, not saved)
+    from config import sanitize_settings
+    wanted = {k: v for k, v in dict(settings.get("game_settings") or {}).items() if hasattr(Config, k)}
+    clean, _ = sanitize_settings(wanted)
+    for name in wanted:
+        saved.setdefault(name, getattr(Config, name))
+        setattr(Config, name, clean.get(name, wanted[name]))
+    if not songs:
+        print(f"Live mode: no songs in category {settings['category']!r}")
+        return
+    themes = [name for name in settings["themes"] if name in Config.color_themes] or list(Config.color_themes)
+
+    def apply_theme(name: str):
+        Config.theme = name
+
+    session = LiveSession(settings, songs, apply_theme, make_chat_source(settings), themes=themes)
+    overlay = LiveOverlay(settings)
+    Config.view_center_offset_y = view_center_offset(settings, Config.SCREEN_HEIGHT)
+    Config.playlist_prefetch_count = 1  # chat requests reach the player as early as possible
+    game = Game()
+    game.live_mode = True
+    game.live_show_hud = bool(settings["show_hud"])
+    live_config = LiveConfigOverlay()
+    session.start()
+    retry_at = 0.0
+    n_frames = 0
+    running = True
+    # MIDI_FRAME_LOG=<file>: per-frame timings (draw / present / tick) for frame-pacing checks
+    import os
+    from time import perf_counter
+    frame_log = open(os.environ["MIDI_FRAME_LOG"], "w") if os.environ.get("MIDI_FRAME_LOG") else None
+    pacer = FramePacer()
+    try:
+        while running:
+            n_frames += 1
+            frame_start = perf_counter()
+            fps = int(Config.fps_limit) or FRAMERATE
+            Config.frame_time = pacer.plan(min(fps, FRAMERATE) if FRAMERATE else fps)
+            update_rainbow_theme()
+            screen.fill(get_colors()["background"])
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    continue
+                if live_config.handle_event(event, game):
+                    continue
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    running = False
+                    continue
+                game.handle_event(event)
+
+            Config.shorts_mode = False  # also when toggled from the F10 panel
+            session.update()
+            found = watcher.poll()
+            if found is not None:
+                added, replaced = session.refresh_library(found)
+                for index, song in added:
+                    if index == len(game.playlist.songs):
+                        game.playlist.songs.append(song)
+                    print(f"Live mode: added {song.name}")
+                for index, song in replaced:
+                    if index < len(game.playlist.songs):
+                        game.playlist.songs[index] = song
+            # endless: (re)start whenever the playlist is not running
+            if (not game.active or not game.auto_advance) and monotonic() >= retry_at:
+                game.active = True
+                message = game.start_playlist(
+                    session.songs, session.next_index(), screen, loop=True, next_index_provider=session.next_index,
+                )
+                if message:
+                    print(f"Live mode: {message}")
+                    game.active = False
+                    retry_at = monotonic() + 5.0
+            session.queue.locked = [game.playlist.current_index] + [slot.index for slot in game.playlist.slots]
+
+            game.draw(screen, n_frames)
+            current = Config.current_song
+            next_slot = game.playlist.slots[0] if game.playlist.slots else None
+            overlay.draw(
+                screen,
+                session,
+                getattr(current, "name", ""),
+                getattr(next_slot.song, "name", "") if next_slot else settings["labels"]["empty_slot"],
+                get_colors()["square"][0],
+            )
+            if live_config.active:  # no 'F10' hint on the stream; the panel still opens with F10
+                live_config.draw(screen, game.active)
+            drawn = perf_counter()
+            pacer.wait()
+            update_screen(screen, glsl_program, render_object)
+            presented = perf_counter()
+            Config.dt = pacer.dt
+            if frame_log is not None:
+                frame_log.write(f"{frame_start:.6f} {drawn:.6f} {presented:.6f} {Config.frame_time:.6f}\n")
+    finally:
+        Config.frame_time = None
+        if frame_log is not None:
+            frame_log.close()
+        session.stop()
+        game.shutdown()
+        for name, value in saved.items():
+            setattr(Config, name, value)
+        Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT = saved_size
+
+
+def main(live_settings: dict | None = None):
     set_resource_root()
 
     # patch to fix mouse on high dpi displays
@@ -244,9 +391,13 @@ def main():
 
     # pygame and other boilerplate
     n_frames = 0
-    pygame.mixer.music.load("./assets/mainmenu.mp3")
+    saved_size = (Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT)
+    if live_settings is None:
+        pygame.mixer.music.load("./assets/mainmenu.mp3")
+        pygame.mixer.music.play(loops=-1, start=2)
+    else:
+        Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT = int(live_settings["width"]), int(live_settings["height"])
     pygame.mixer.music.set_volume(Config.volume / 100)
-    pygame.mixer.music.play(loops=-1, start=2)
 
     clock = pygame.time.Clock()
 
@@ -255,11 +406,22 @@ def main():
     if "Linux" in get_os():
         do_vsync = 0  # otherwise error of "regular vsync for OpenGL not available" at least that's what i got under wsl
     # noinspection PyUnusedLocal
-    if [Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT] == [pygame.display.Info().current_w,pygame.display.Info().current_h]:
+    window_size = [Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT]
+    if live_settings is not None:
+        window_size = live_window_size(live_settings)
+        # OBS window capture only gets the part of the window that is on a screen: open it fully inside the
+        # primary monitor (right side, below the title bar) - window_pos [x, y] in live.json overrides
+        import os
+        pos = live_settings.get("window_pos") or []
+        if len(pos) != 2:
+            desktop = pygame.display.get_desktop_sizes()[0]
+            pos = [max(desktop[0] - window_size[0] - 40, 0), max(min(40, desktop[1] - window_size[1]), 0)]
+        os.environ["SDL_VIDEO_WINDOW_POS"] = f"{int(pos[0])},{int(pos[1])}"
+    elif window_size == [pygame.display.Info().current_w, pygame.display.Info().current_h]:
         flags |= pygame.FULLSCREEN
-    
+
     real_screen = pygame.display.set_mode(
-        [Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT],
+        window_size,
         flags,
         vsync=do_vsync
     )
@@ -306,6 +468,16 @@ def main():
     Config.glsl_program = glsl_program
     Config.render_object = render_object
     Config.screen = screen
+    # the live window shows the 1080x1920 frame scaled down: smooth filtering instead of dropped pixels
+    Config.texture_smooth = list(window_size) != [Config.SCREEN_WIDTH, Config.SCREEN_HEIGHT]
+
+    if live_settings is not None:
+        try:
+            run_live_loop(screen, glsl_program, render_object, clock, live_settings, saved_size)
+        finally:
+            pygame.quit()
+            save_to_file()
+        return
 
     # the big guns
     menu = Menu()
@@ -319,17 +491,12 @@ def main():
 
     # game loop
     running = True
+    pacer = FramePacer()
     while running:
         n_frames += 1
-        # thanks to TheCodingCrafter for the implementation
-        if Config.theme == "rainbow":
-            to_set_as_rainbow = pygame.Color((0, 0, 0))
-            to_set_as_rainbow2 = pygame.Color((0, 0, 0))
-            to_set_as_rainbow.hsva = (((pygame.time.get_ticks() / 1000) * Config.rainbow_speed) % 360, 100, 75, 100)
-            to_set_as_rainbow2.hsva = ((((pygame.time.get_ticks() / 1000) * Config.rainbow_speed) + 180) % 360, 100, 75, 100)
-            get_colors()["background"] = to_set_as_rainbow
-            get_colors()["hallway"] = to_set_as_rainbow2
-            get_colors()["square"][0] = to_set_as_rainbow
+        fps = int(Config.fps_limit) or FRAMERATE
+        Config.frame_time = pacer.plan(min(fps, FRAMERATE) if FRAMERATE else fps)
+        update_rainbow_theme()
 
         screen.fill(get_colors()["background"])
         for event in pygame.event.get():
@@ -477,9 +644,9 @@ def main():
         square_customizer_page.draw(screen)
         live_config.draw(screen, game.active)
 
+        pacer.wait()  # exact 1/fps, just before a display refresh (pygame's tick waits whole milliseconds)
         update_screen(screen, glsl_program, render_object)
-
-        Config.dt = clock.tick(FRAMERATE) / 1000
+        Config.dt = pacer.dt
     game.shutdown()
     pygame.quit()
     save_to_file()
@@ -501,4 +668,8 @@ if __name__ == '__main__':
         raise SystemExit(run_import_smoke_test())
     if "--customizer-smoke-test" in sys.argv:
         raise SystemExit(run_customizer_smoke_test())
+    if "--live" in sys.argv:
+        from live import load_live_settings, apply_cli_overrides
+        main(apply_cli_overrides(load_live_settings(), sys.argv))
+        raise SystemExit(0)
     main()

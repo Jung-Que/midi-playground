@@ -6,7 +6,7 @@ from camera import Camera
 from keystrokes import Keystrokes
 from particle import Particle
 from bounce import Bounce
-from square import Square
+from square import Square, accent_for_direction
 from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -82,7 +82,9 @@ class Game:
         self.consecutive_skips = 0
         self.fps_smoothed = 0.0
         self.visible_peg_count = 0
-        self.peg_order_font = get_font(16)
+        self.inherited_reveal: dict = {}  # reveal states handed from the previous song's preview
+        self.next_preview_shown = False
+        self.preview_keys: set = set()
         self.square_afterimages = deque(maxlen=max(int(Config.square_afterimage_count), 1))
         self.afterimage_elapsed = 0.0
         self._afterimage_layer = None
@@ -98,12 +100,18 @@ class Game:
         self.master_start_pos = [0.0, 0.0]
         self.master_start_dir = [1, 1]
         self.current_audio_source = None
+        self.live_mode = False  # live stream: no gameplay UI or status text on screen
+        self.live_show_hud = False
 
-    def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface):
+    def start_playlist(self, songs: list, selected_index: int, screen: pygame.Surface, loop: bool = False,
+                       next_index_provider=None):
+        """loop: keep going forever even with a single song (live mode).
+        next_index_provider(base_index) -> index picks each next song (live queue); default: list order."""
         self.stop_playlist(recreate_controller=True)
         self.consecutive_skips = 0
         self.shorts_loop_count = 0
         self.playlist.configure(songs, selected_index)
+        self.playlist.next_index_provider = next_index_provider
         Config.current_song = songs[selected_index]
         try:
             prepared = self.playlist.prepare_current([0.0, 0.0], [1, 1])
@@ -115,7 +123,7 @@ class Game:
         if result:
             return result
         self.playlist.release_active_audio()
-        self.auto_advance = len(songs) > 1 and not Config.shorts_mode
+        self.auto_advance = (len(songs) > 1 or loop) and not Config.shorts_mode
         pygame.mixer.music.set_endevent(TRACK_END_EVENT)
         self._prepare_next_song()
 
@@ -129,6 +137,10 @@ class Game:
             audio_override: tuple[bytes, str] = None,
     ):
         random.seed(Config.seed)
+        carried_scene = self._passed_scene() if audio_already_playing else None
+        self.inherited_reveal = self._upcoming_reveal_states() if audio_already_playing else {}
+        self.next_preview_shown = False
+        self.preview_keys = set()
         self.world = World()
         self.notes = []
         self.safe_areas = []
@@ -170,6 +182,8 @@ class Game:
                 return f"Unable to generate map: {exc}"
 
         self._apply_prepared_map(prepared)
+        if carried_scene:
+            self._prepend_scene(*carried_scene)
         self.master_bounce_data = [
             (pos.copy(), direction.copy(), timestamp, axis)
             for pos, direction, timestamp, axis in prepared.bounces
@@ -188,7 +202,8 @@ class Game:
             self.audio_clock.start_now(self.world.start_time)
             self.world.square.pos = start_pos.copy()
             self.world.square.dir = start_dir.copy()
-            self.world.reset_motion_anchor(self.world.square, 0.0)
+            # a continued route left start_pos before 0 s (it glided through the previous song's tail)
+            self.world.reset_motion_anchor(self.world.square, min(float(prepared.start_time), 0.0))
         else:
             try:
                 if audio_override is None:
@@ -209,6 +224,106 @@ class Game:
                 self.world.square.dir = [0, 0]
                 self.world.square.pos = self.world.future_bounces[0].square_pos.copy()
                 self.world.reset_motion_anchor(self.world.square, 0.0)
+
+    def _passed_scene(self):
+        """Pegs and hallways the outgoing song already passed, re-timed so 'now' is 0 s of the incoming song.
+        The incoming song's own preview is left out: its map brings those again."""
+        self._ensure_map_metadata_alignment()
+        now = self.world.time - self.play_delay_ms / 1000 + Config.music_offset / 1000
+        preview = getattr(self, "preview_keys", set())
+        geometry = [
+            (rect, timestamp - now, color, visible_since)
+            for rect, timestamp, color, visible_since in zip(
+                self.world.rectangles, self.world.collision_times, self.world.colors, self.geometry_visible_since,
+            )
+            if timestamp <= now and ("p", tuple(rect)) not in preview
+        ]
+        hallways = [
+            (rect, timestamp - now, visible_since)
+            for rect, timestamp, visible_since in zip(self.safe_areas, self.safe_area_times, self.safe_area_visible_since)
+            if timestamp <= now and ("h", tuple(rect)) not in preview
+        ]
+        return geometry, hallways
+
+    def _upcoming_reveal_states(self) -> dict:
+        """Reveal state of the previewed next-song pegs/hallways, handed to the same items when its map loads,
+        so nothing that was already drawn blinks at the song change."""
+        self._ensure_map_metadata_alignment()
+        states = {}
+        for key in getattr(self, "preview_keys", set()):
+            states[key] = None
+        for rect, since in zip(self.world.rectangles, self.geometry_visible_since):
+            if ("p", tuple(rect)) in states:
+                states[("p", tuple(rect))] = since
+        for rect, since in zip(self.safe_areas, self.safe_area_visible_since):
+            if ("h", tuple(rect)) in states:
+                states[("h", tuple(rect))] = since
+        return {key: since for key, since in states.items() if since is not None}
+
+    def _current_map_fully_loaded(self) -> bool:
+        return all(
+            chunk.materialized and chunk.geometry_cursor >= len(chunk.rectangles)
+            and chunk.safe_area_cursor >= len(chunk.safe_areas)
+            for chunk in self.map_chunks
+        )
+
+    END_GLIDE_OVERRUN = 1.0  # seconds the square may run past the audio end while the next song takes over
+
+    def _preview_next_song(self):
+        """Before the current song ends: glide the square on through its silent tail into the next song's route,
+        and put the next song's pegs into the scene (drawn as soon as they are off screen, like any other)."""
+        if (
+                self.next_preview_shown or not self.auto_advance or self.shorts_session_active or
+                not self.world.map_stream_complete or not self._current_map_fully_loaded()
+        ):
+            return
+        peeked = self.playlist.peek_next_map()
+        if peeked is None:
+            return
+        prepared, queued = peeked
+        self.next_preview_shown = True
+        duration = self.playlist.active_duration()
+        last_bounce = self.world.future_bounces[-1] if self.world.future_bounces else (
+            self.world.past_bounces[-1] if self.world.past_bounces else None)
+        if last_bounce is None:
+            return
+        last_map_time = last_bounce.time - self.bounce_schedule_offset
+        # next song's 0 s on this song's map timeline: the end of this song's audio
+        offset = duration if duration > 0 else last_map_time - float(prepared.start_time)
+        if prepared.start_time < 0:
+            # glide through the silent tail, and on past it for a moment: the song change is handled a frame or
+            # two after the audio ends, and the next route continues this very line, so it must not stop and jump
+            self.world.set_end_glide(
+                self.world.square, last_bounce.time - float(prepared.start_time) + self.END_GLIDE_OVERRUN,
+            )
+        bounces = list(prepared.bounces)
+        for chunk in queued:
+            bounces.extend(chunk.bounces)
+        previous = self._square_rect(prepared.start_pos)
+        for position, direction, timestamp, axis in bounces:
+            rect = Bounce(position, direction, timestamp, axis).get_collision_rect()
+            target = self._square_rect(position)
+            hallway = previous.union(target)
+            previous = target
+            self.world.rectangles.append(rect)
+            self.world.collision_times.append(offset + timestamp)
+            self.world.colors.append(tuple(direction))
+            self.geometry_visible_since.append(None)
+            self.safe_areas.append(hallway)
+            self.safe_area_times.append(offset + timestamp)
+            self.safe_area_visible_since.append(None)
+            self.preview_keys.add(("p", tuple(rect)))
+            self.preview_keys.add(("h", tuple(hallway)))
+
+    def _prepend_scene(self, geometry, hallways):
+        """Keep the previous song's scene on screen; the rolling-world prune drops it once it is off screen."""
+        self.world.rectangles[:0] = [item[0] for item in geometry]
+        self.world.collision_times[:0] = [item[1] for item in geometry]
+        self.world.colors[:0] = [item[2] for item in geometry]
+        self.geometry_visible_since[:0] = [item[3] for item in geometry]
+        self.safe_areas[:0] = [item[0] for item in hallways]
+        self.safe_area_times[:0] = [item[1] for item in hallways]
+        self.safe_area_visible_since[:0] = [item[2] for item in hallways]
 
     def _apply_prepared_map(self, prepared: PreparedMap):
         self.world.square = Square(*prepared.start_pos, *prepared.start_dir)
@@ -358,17 +473,13 @@ class Game:
     def _materialize_chunk(self, chunk: RuntimeMapChunk):
         if chunk.materialized:
             return
-        palette = [
-            (224, 50, 50), (80, 210, 100), (230, 220, 50),
-            (174, 170, 210), (245, 77, 247), (255, 153, 0),
-        ]
         previous = self._square_rect(chunk.start_position)
         for position, direction, timestamp, axis in chunk.bounce_data:
             bounce = Bounce(position, direction, timestamp, axis)
             target = self._square_rect(position)
             chunk.rectangles.append(bounce.get_collision_rect())
             chunk.collision_times.append(timestamp)
-            chunk.colors.append(random.choice(palette))
+            chunk.colors.append(tuple(direction))  # direction after the bounce -> the square's colour (drawn by theme)
             chunk.safe_areas.append(previous.union(target))
             chunk.safe_area_times.append(timestamp)
             previous = target
@@ -390,13 +501,12 @@ class Game:
                     chunk.collision_times[chunk.geometry_cursor] <= horizon
             ):
                 source_index = chunk.geometry_cursor
-                target_index = len(self.world.rectangles)
                 rect = chunk.rectangles[source_index]
                 self.world.rectangles.append(rect)
                 self.world.collision_times.append(chunk.collision_times[source_index])
                 self.world.colors.append(chunk.colors[source_index])
-                self.geometry_visible_since.append(monotonic())
-                self.world.geometry_index.insert(target_index, rect)
+                # not revealed yet (see _reveal_unseen), unless it was already drawn as the previous song's preview
+                self.geometry_visible_since.append(self.inherited_reveal.pop(("p", tuple(rect)), None))
                 chunk.geometry_cursor += 1
 
             while (
@@ -404,12 +514,10 @@ class Game:
                     chunk.safe_area_times[chunk.safe_area_cursor] <= horizon
             ):
                 source_index = chunk.safe_area_cursor
-                target_index = len(self.safe_areas)
                 rect = chunk.safe_areas[source_index]
                 self.safe_areas.append(rect)
                 self.safe_area_times.append(chunk.safe_area_times[source_index])
-                self.safe_area_visible_since.append(monotonic())
-                self.world.safe_area_index.insert(target_index, rect)
+                self.safe_area_visible_since.append(self.inherited_reveal.pop(("h", tuple(rect)), None))
                 chunk.safe_area_cursor += 1
 
         # Once a chunk has handed off all of its records, its metadata can go.
@@ -526,7 +634,8 @@ class Game:
         if not self.auto_advance:
             return
         start_pos, start_dir = self._end_state()
-        if self.playlist.slots:
+        if self.playlist.slots or self.playlist.active_slot is not None:
+            # never rebuild the queue here: that used to cut the stream of the song that is playing
             self.playlist.ensure_prefetch(start_pos, start_dir)
         else:
             self.playlist.prepare_ahead(start_pos, start_dir)
@@ -549,6 +658,12 @@ class Game:
         if start_dir == [0, 0] and self.world.future_bounces:
             start_dir = self.world.future_bounces[0].square_dir.copy()
 
+        # pegs already hit stay on screen for a while: keep the new route clear of them too
+        obstacles = [
+            (rect, timestamp)
+            for rect, timestamp in zip(self.world.rectangles, self.world.collision_times)
+            if timestamp <= map_time
+        ]
         try:
             prepared = prepare_notes_map(
                 remaining_notes,
@@ -556,6 +671,8 @@ class Game:
                 start_pos,
                 start_dir,
                 start_time=map_time,
+                min_spacing_ms=getattr(Config.current_song, "min_spacing_ms", None),
+                obstacles=obstacles,
             )
         except Exception as exc:
             self.stream_message = f"Live map update failed: {exc}"
@@ -594,7 +711,6 @@ class Game:
         self.safe_areas = [item[0] for item in past_safe_areas]
         self.safe_area_times = [item[1] for item in past_safe_areas]
         self.safe_area_visible_since = [item[2] for item in past_safe_areas]
-        self.world.rebuild_spatial_indexes(self.safe_areas)
         self.map_chunks = self._build_runtime_chunks(prepared)
         self._active_chunk_signature = None
         self._refresh_map_window(map_time, force=True)
@@ -603,7 +719,13 @@ class Game:
         self.world.reset_motion_anchor(self.world.square, schedule_time)
 
         end_pos, end_dir = self._end_state()
-        self.playlist.refresh_next_map(end_pos, end_dir)
+        self.next_preview_shown = False
+        self.preview_keys = set()
+        self.world.end_glide_until = None
+        duration = self.playlist.active_duration()
+        last_time = (bounces[-1].time - schedule_offset) if bounces else map_time
+        tail = -max(duration - last_time, 0.0) if duration > 0 else 0.0
+        self.playlist.refresh_next_map(end_pos, end_dir, start_time=tail)
         self.stream_message = "Future map updated"
 
     def _queue_next_audio(self):
@@ -654,6 +776,7 @@ class Game:
         if self.auto_advance:
             end_pos, end_dir = self._end_state()
             self.playlist.ensure_prefetch(end_pos, end_dir)
+            self._preview_next_song()
         self._queue_next_audio()
         if not self.transition_pending:
             return
@@ -741,34 +864,26 @@ class Game:
             int(screen_rect.width * margin),
             int(screen_rect.height * margin),
         )
+        # one world-space rectangle instead of converting every peg to screen space each frame
+        nearby = self.camera.world_view(expanded_view)
 
-        geometry_count = len(self.world.rectangles)
-        kept_geometry = []
-        for rect, collision_time, color, visible_since in zip(
-                self.world.rectangles, self.world.collision_times, self.world.colors,
-                self.geometry_visible_since,
-        ):
-            visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
-            if collision_time >= cutoff or visible_nearby:
-                kept_geometry.append((rect, collision_time, color, visible_since))
-        self.world.rectangles = [item[0] for item in kept_geometry]
-        self.world.collision_times = [item[1] for item in kept_geometry]
-        self.world.colors = [item[2] for item in kept_geometry]
-        self.geometry_visible_since = [item[3] for item in kept_geometry]
-
-        safe_area_count = len(self.safe_areas)
-        kept_safe_areas = []
-        for rect, area_time, visible_since in zip(
-                self.safe_areas, self.safe_area_times, self.safe_area_visible_since
-        ):
-            visible_nearby = expanded_view.colliderect(self.camera.offset(rect))
-            if area_time >= cutoff or visible_nearby:
-                kept_safe_areas.append((rect, area_time, visible_since))
-        self.safe_areas = [item[0] for item in kept_safe_areas]
-        self.safe_area_times = [item[1] for item in kept_safe_areas]
-        self.safe_area_visible_since = [item[2] for item in kept_safe_areas]
-        if geometry_count != len(kept_geometry) or safe_area_count != len(kept_safe_areas):
-            self.world.rebuild_spatial_indexes(self.safe_areas)
+        keep_geometry = [
+            collision_time >= cutoff or nearby.colliderect(rect)
+            for rect, collision_time in zip(self.world.rectangles, self.world.collision_times)
+        ]
+        keep_safe_areas = [
+            area_time >= cutoff or nearby.colliderect(rect)
+            for rect, area_time in zip(self.safe_areas, self.safe_area_times)
+        ]
+        if not all(keep_geometry):
+            self.world.rectangles = [v for v, keep in zip(self.world.rectangles, keep_geometry) if keep]
+            self.world.collision_times = [v for v, keep in zip(self.world.collision_times, keep_geometry) if keep]
+            self.world.colors = [v for v, keep in zip(self.world.colors, keep_geometry) if keep]
+            self.geometry_visible_since = [v for v, keep in zip(self.geometry_visible_since, keep_geometry) if keep]
+        if not all(keep_safe_areas):
+            self.safe_areas = [v for v, keep in zip(self.safe_areas, keep_safe_areas) if keep]
+            self.safe_area_times = [v for v, keep in zip(self.safe_area_times, keep_safe_areas) if keep]
+            self.safe_area_visible_since = [v for v, keep in zip(self.safe_area_visible_since, keep_safe_areas) if keep]
         self.world.prune_past_bounces(retention)
 
     def _ensure_map_metadata_alignment(self):
@@ -786,75 +901,81 @@ class Game:
             del self.safe_area_visible_since[len(self.safe_areas):]
 
     @staticmethod
-    def _reveal_color(start, target, visible_since: float, reveal_time: float):
+    def _reveal_color(start, target, visible_since: Optional[float], reveal_time: float):
         duration = max(float(Config.map_fade_seconds), 0.0)
-        if duration == 0:
+        if duration == 0 or visible_since is None:
             return target
         progress = max(0.0, min(1.0, (reveal_time - visible_since) / duration))
         return pygame.Color(start).lerp(pygame.Color(target), progress)
 
+    def _reveal_unseen(self, world_view: pygame.Rect):
+        """Upcoming pegs and hallways are revealed while they are off screen, so none is seen popping in.
+
+        Everything loaded (map_preload_seconds ahead) can be drawn this way; the route planner keeps every peg of
+        the song clear of every route, so drawing far ahead never shows a route crossing a peg.
+        """
+        self._ensure_map_metadata_alignment()
+        margin_x, margin_y = int(world_view.width * 0.1), int(world_view.height * 0.1)
+        view = world_view.inflate(margin_x, margin_y)
+        already_faded_in = monotonic() - max(float(Config.map_fade_seconds), 0.0) - 1.0
+        for index, since in enumerate(self.geometry_visible_since):
+            if since is None and not view.colliderect(self.world.rectangles[index]):
+                self.geometry_visible_since[index] = already_faded_in
+        for index, since in enumerate(self.safe_area_visible_since):
+            if since is None and not view.colliderect(self.safe_areas[index]):
+                self.safe_area_visible_since[index] = already_faded_in
+
     def _visible_map_records(self, map_time: float):
-        """Choose a small, readable set without reducing the generated map."""
-        future = [
-            index for index, timestamp in enumerate(self.world.collision_times)
-            if timestamp >= map_time
-        ]
-        past = [
-            index for index, timestamp in enumerate(self.world.collision_times)
-            if map_time - float(Config.peg_past_fade_seconds) <= timestamp < map_time
-        ]
+        """Every revealed upcoming peg, plus at least the next peg_visible_max (fading in if they were never off
+        screen), plus every passed peg and hallway.
 
-        density_window = max(float(Config.peg_density_window_seconds), 0.1)
-        preview_seconds = max(float(Config.peg_preview_seconds), 0.1)
-        local_bounces = sum(
-            self.world.collision_times[index] < map_time + density_window
-            for index in future
+        Nothing passed is faded or capped here: the rolling-world prune drops it only once it is off screen.
+        """
+        self._ensure_map_metadata_alignment()
+        future = sorted(
+            (index for index, timestamp in enumerate(self.world.collision_times) if timestamp >= map_time),
+            key=lambda index: self.world.collision_times[index],
         )
-        local_rate = local_bounces / density_window
-        minimum = max(int(Config.peg_visible_min), 1)
-        maximum = max(int(Config.peg_visible_max), minimum)
-        future_limit = max(minimum, min(maximum, ceil(local_rate * preview_seconds)))
-
-        padding = max(int(Config.peg_overlap_padding), 0)
-
-        def select_non_overlapping(candidates, limit):
-            selected = []
-            occupied = []
-            # Look slightly farther than the visible limit so an overlapping
-            # distant marker does not prevent a clearer marker from replacing it.
-            for index in candidates[:max(limit * 2, limit)]:
-                bounds = self.world.rectangles[index].inflate(padding * 2, padding * 2)
-                if occupied and any(bounds.colliderect(other) for other in occupied):
-                    continue
-                selected.append(index)
-                occupied.append(bounds)
-                if len(selected) >= limit:
-                    break
-            return selected
-
-        selected_future = select_non_overlapping(future, future_limit)
-        selected_past = select_non_overlapping(
-            list(reversed(past)), max(int(Config.peg_visible_past_max), 0)
-        )
-        geometry = set(selected_future + selected_past)
-        selected_times = {
-            self.world.collision_times[index] for index in geometry
-        }
-        safe_areas = {
-            index for index, timestamp in enumerate(self.safe_area_times)
-            if timestamp in selected_times
-        }
+        past = [index for index, timestamp in enumerate(self.world.collision_times) if timestamp < map_time]
+        future_limit = max(int(Config.peg_visible_max), 1)
+        forced = future[:future_limit]
+        now = monotonic()
+        for index in forced:
+            if self.geometry_visible_since[index] is None:
+                self.geometry_visible_since[index] = now
+        revealed_future = [index for index in future if self.geometry_visible_since[index] is not None]
+        geometry = set(revealed_future + past)
+        forced_times = {self.world.collision_times[index] for index in forced}
+        safe_areas = set()
+        for index, timestamp in enumerate(self.safe_area_times):
+            if self.safe_area_visible_since[index] is None and timestamp in forced_times:
+                self.safe_area_visible_since[index] = now
+            if self.safe_area_visible_since[index] is not None or timestamp < map_time:
+                safe_areas.add(index)
         next_peg = future[0] if future else None
-        # The immediate target is never suppressed, even if configuration or
-        # overlap filtering would otherwise remove it.
-        if next_peg is not None:
-            geometry.add(next_peg)
-            selected_times.add(self.world.collision_times[next_peg])
-            safe_areas.update(
-                index for index, timestamp in enumerate(self.safe_area_times)
-                if timestamp == self.world.collision_times[next_peg]
-            )
         return geometry, safe_areas, next_peg, future_limit
+
+    def _camera_path_focus(self, schedule_time: float):
+        """Average square position over the next camera_lookahead_seconds of the planned route."""
+        horizon = max(float(Config.camera_lookahead_seconds), 0.0)
+        square = self.world.square
+        if horizon == 0.0 or square.dir == [0, 0]:
+            return None
+        speed = float(Config.square_speed)
+        pos, direction, anchor = list(square.pos), list(square.dir), float(schedule_time)
+        upcoming = iter(self.world.future_bounces)
+        bounce = next(upcoming, None)
+        samples = 16
+        total_x = total_y = 0.0
+        for step in range(1, samples + 1):
+            sample_time = schedule_time + horizon * step / samples
+            while bounce is not None and bounce.time <= sample_time:
+                if bounce.time > anchor:
+                    pos, direction, anchor = list(bounce.square_pos), list(bounce.square_dir), bounce.time
+                bounce = next(upcoming, None)
+            total_x += pos[0] + direction[0] * speed * (sample_time - anchor)
+            total_y += pos[1] + direction[1] * speed * (sample_time - anchor)
+        return total_x / samples, total_y / samples
 
     def _next_peg_world_position(self, map_time: float):
         for index, timestamp in enumerate(self.world.collision_times):
@@ -1005,7 +1126,12 @@ class Game:
         # set world time
         self.world.update_time()
         if self.music_has_played:
-            self.world.time = self.playback_origin + self.audio_clock.position() + self.play_delay_ms / 1000
+            # drawn for the moment this frame reaches the screen (FramePacer), not for 'now'
+            if Config.frame_time is None:
+                song_position = self.audio_clock.position()
+            else:
+                song_position = self.audio_clock.position(present_at=Config.frame_time)
+            self.world.time = self.playback_origin + song_position + self.play_delay_ms / 1000
             self.transition_lag_ms = abs(self.audio_clock.drift_ms)
         elif self.shorts_session_active:
             self.world.time += self.playback_origin
@@ -1034,13 +1160,17 @@ class Game:
             self.camera.follow(
                 self.world.square,
                 self._next_peg_world_position(map_time),
+                self._camera_path_focus(schedule_time),
             )
 
         self._prune_rolling_world(screen_rect)
         world_view = self.camera.world_view(screen_rect)
 
         # bounce anim
+        # place the square from its float centre in one rounding step (Square.rect truncates first, which adds
+        # a second, independent 1 px rounding against the camera)
         sqrect = self.camera.offset(self.world.square.rect)
+        sqrect.center = self.camera.offset((self.world.square.x, self.world.square.y))
         if Config.bounce_effect and (self.world.time - 0.25) + Config.music_offset / 1000 < self.world.square.last_bounce_time:
             lerp = abs((self.world.time - 0.25 + Config.music_offset / 1000) - self.world.square.last_bounce_time) * 5
             lerp = lerp ** 2  # square it for better-looking interpolation
@@ -1053,23 +1183,10 @@ class Game:
         total_rects = 0
         colors = get_colors()
         reveal_time = monotonic()
+        self._reveal_unseen(world_view)
         visible_geometry, visible_safe_areas, next_peg, _ = self._visible_map_records(map_time)
         self.visible_peg_count = len(visible_geometry)
-        future_peg_order = sorted(
-            (
-                index for index in visible_geometry
-                if self.world.collision_times[index] >= map_time
-            ),
-            key=lambda index: self.world.collision_times[index],
-        )
-        peg_ranks = {
-            index: rank
-            for rank, index in enumerate(
-                future_peg_order[:max(int(Config.peg_order_count), 0)],
-                start=1,
-            )
-        }
-        for safe_index in self.world.visible_safe_areas(world_view):
+        for safe_index in world_view.collidelistall(self.safe_areas):
             if safe_index not in visible_safe_areas:
                 continue
             safe_area = self.safe_areas[safe_index]
@@ -1080,19 +1197,7 @@ class Game:
                     colors["background"], colors["hallway"],
                     self.safe_area_visible_since[safe_index], reveal_time,
                 )
-                if self.safe_area_times[safe_index] < map_time:
-                    fade = min(
-                        1.0,
-                        (map_time - self.safe_area_times[safe_index]) /
-                        max(float(Config.peg_past_fade_seconds), 0.001),
-                    )
-                    color = pygame.Color(color).lerp(colors["background"], fade)
                 pygame.draw.rect(screen, color, offsetted)
-
-        if Config.peg_guide_line and next_peg is not None:
-            target = self.camera.offset(self.world.rectangles[next_peg]).center
-            guide_color = pygame.Color(colors["hallway"]).lerp(colors["square"][0], 0.65)
-            pygame.draw.line(screen, guide_color, sqrect.center, target, width=2)
 
         # draw pegs
         for i in self.world.visible_geometry(world_view):
@@ -1104,8 +1209,11 @@ class Game:
             if offsetted.colliderect(screen_rect):
                 total_rects += 1
                 draw_rect = offsetted.copy()
+                peg_color = self.world.colors[i]
+                if len(peg_color) == 2:  # stored as the square's direction after this bounce
+                    peg_color = accent_for_direction(*peg_color)
                 if Config.do_color_bounce_pegs and self.world.collision_times[i] < (self.world.time * 1000 + Config.music_offset - self.play_delay_ms)/1000:
-                    target_color = self.world.colors[i]
+                    target_color = peg_color
                 else:
                     target_color = colors["background"]
                 color = self._reveal_color(
@@ -1114,12 +1222,6 @@ class Game:
                 )
                 if self.world.collision_times[i] < map_time:
                     impact_age = map_time - self.world.collision_times[i]
-                    fade = min(
-                        1.0,
-                        impact_age /
-                        max(float(Config.peg_past_fade_seconds), 0.001),
-                    )
-                    color = pygame.Color(color).lerp(colors["hallway"], fade)
                     impact_duration = max(float(Config.peg_impact_seconds), 0.001)
                     if impact_age < impact_duration:
                         strength = 1.0 - impact_age / impact_duration
@@ -1128,12 +1230,13 @@ class Game:
                             draw_rect.inflate_ip(amount, -amount // 2)
                         else:
                             draw_rect.inflate_ip(-amount // 2, amount)
-                        color = pygame.Color(color).lerp(colors["square"][0], strength * 0.75)
+                        color = pygame.Color(color).lerp(peg_color, strength * 0.75)
                 pygame.draw.rect(screen, color, draw_rect)
                 if i == next_peg:
+                    # the marker shows the colour the square (and this peg) turns at this bounce
                     pygame.draw.rect(
                         screen,
-                        colors["square"][0],
+                        peg_color,
                         offsetted.inflate(12, 12),
                         width=3,
                         border_radius=3,
@@ -1144,22 +1247,15 @@ class Game:
                         progress = time_to_hit / countdown
                         radius = int(max(offsetted.width, offsetted.height) / 2 + 8 + 28 * progress)
                         pygame.draw.circle(
-                            screen, colors["square"][0], offsetted.center, radius, width=2
+                            screen, peg_color, offsetted.center, radius, width=2
                         )
-
-                if i in peg_ranks:
-                    label = self.peg_order_font.render(
-                        str(peg_ranks[i]), True, colors["square"][0]
-                    )
-                    label_rect = label.get_rect(midbottom=(offsetted.centerx, offsetted.top - 7))
-                    screen.blit(label, label_rect)
 
                 impact_age = map_time - self.world.collision_times[i]
                 ring_duration = max(float(Config.peg_impact_ring_seconds), 0.001)
                 if 0.0 <= impact_age < ring_duration:
                     progress = impact_age / ring_duration
                     radius = int(max(offsetted.width, offsetted.height) / 2 + 8 + 32 * progress)
-                    ring_color = pygame.Color(colors["square"][0]).lerp(colors["hallway"], progress)
+                    ring_color = pygame.Color(peg_color).lerp(colors["hallway"], progress)
                     pygame.draw.circle(screen, ring_color, offsetted.center, radius, width=2)
 
         self._draw_square_afterimages(screen, reveal_time)
@@ -1167,7 +1263,7 @@ class Game:
                 
         # scorekeeper drawing
         time_from_start = self.world.time-self.play_delay_ms/1000+Config.music_offset/1000
-        show_gameplay_ui = not Config.theatre_mode and not (Config.shorts_mode and Config.shorts_clean_ui)
+        show_gameplay_ui = not Config.theatre_mode and not (Config.shorts_mode and Config.shorts_clean_ui) and not self.live_mode
         if show_gameplay_ui:
             self.misses = self.world.scorekeeper.draw(screen, time_from_start if len(self.world.future_bounces) else -1, self.misses)
 
@@ -1272,7 +1368,7 @@ class Game:
 
         self._draw_shorts_overlays(screen, map_time, time_from_start - self.playback_origin)
 
-        clean_shorts = Config.shorts_mode and Config.shorts_clean_ui
+        clean_shorts = (Config.shorts_mode and Config.shorts_clean_ui) or self.live_mode
         if not self.camera.locked_on_square and not clean_shorts:
             screen.blit(self.camera_ctrl_text, (10, 10))
 
@@ -1288,7 +1384,8 @@ class Game:
             self.fps_smoothed = instant_fps
         else:
             self.fps_smoothed = self.fps_smoothed * 0.9 + instant_fps * 0.1
-        if not Config.performance_hud or (Config.shorts_mode and Config.shorts_clean_ui):
+        if not Config.performance_hud or (Config.shorts_mode and Config.shorts_clean_ui) or (
+                self.live_mode and not self.live_show_hud):
             return
 
         if not tracemalloc.is_tracing():

@@ -3,20 +3,20 @@ from collections import deque
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-import random
 from math import floor
 from threading import Lock
 from time import perf_counter
-from typing import Optional
+from typing import Optional, Sequence
 from uuid import uuid4
 from zipfile import ZipFile
+
+import pygame
 
 from bounce import Bounce
 from config import Config
 from errors import MapLoadingFailureError
-from spatial import SpatialHash
-from square import Square
-from utils import read_midi_file, read_osu_file, remove_too_close_values
+from routeplanner import plan_route
+from utils import MapNote, read_midi_notes, read_osu_file, thin_notes
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class SongSpec:
     audio_file_name: str
     music_offset: int
     is_from_osu_file: bool
+    min_spacing_ms: Optional[float] = None  # per-song floor for bounce_min_spacing (metadata "bounce_min_spacing")
 
 
 @dataclass
@@ -50,6 +51,7 @@ class PreparedMap:
     warning: str = ""
     complete: bool = True
     stream_slot: object = field(default=None, repr=False, compare=False)
+    start_time: float = 0.0  # the route leaves start_pos at this song time (< 0: it continues the previous song)
 
     @property
     def end_state(self) -> tuple[list[float], list[int]]:
@@ -67,6 +69,7 @@ def song_to_spec(song) -> SongSpec:
         audio_file_name=song.audio_file_name,
         music_offset=song.music_offset,
         is_from_osu_file=song.is_from_osu_file,
+        min_spacing_ms=getattr(song, "min_spacing_ms", None),
     )
 
 
@@ -92,11 +95,49 @@ def read_song_audio(spec: SongSpec) -> tuple[bytes, str]:
     return audio, Path(spec.audio_file_name).suffix.lower()
 
 
-def _read_notes(spec: SongSpec) -> list[float]:
+MAP_TAIL_TOLERANCE = 2.0  # seconds of audio notes after the map's last note before the map is extended
+
+
+def _read_notes(spec: SongSpec) -> list[MapNote]:
     with ZipFile(spec.filepath) as archive:
         if spec.is_from_osu_file:
-            return read_osu_file(archive.read(spec.song_file_name))
-        return read_midi_file(BytesIO(archive.read(spec.song_file_name)))
+            return [(timestamp, None, 0.0) for timestamp in read_osu_file(archive.read(spec.song_file_name))]
+        notes = read_midi_notes(BytesIO(archive.read(spec.song_file_name)))
+        audio_name = spec.audio_file_name
+        if audio_name != spec.song_file_name and audio_name.lower().endswith((".mid", ".midi")):
+            audio_notes = read_midi_notes(BytesIO(archive.read(audio_name)), skip_channels=(9,))
+            notes = _extend_to_audio_end(notes, audio_notes)
+        return notes
+
+
+def _extend_to_audio_end(notes: list[MapNote], audio_notes: list[MapNote]) -> list[MapNote]:
+    """A map MIDI that stops before its audio MIDI (e.g. a truncated melody file) continues with the audio's top line,
+    so the map lasts until the song does."""
+    if not audio_notes:
+        return notes
+    last = notes[-1][0] if notes else float("-inf")
+    if audio_notes[-1][0] - last <= MAP_TAIL_TOLERANCE:
+        return notes
+    return notes + [note for note in audio_notes if note[0] > last + 0.25]
+
+
+def _as_map_notes(notes) -> list[MapNote]:
+    """Accept plain timestamps (live regeneration, osu) as well as MapNotes."""
+    return [note if isinstance(note, tuple) else (note, None, 0.0) for note in notes]
+
+
+def _filter_map_notes(notes: list[MapNote], min_spacing_ms: Optional[float] = None) -> list[MapNote]:
+    notes = notes[:Config.max_notes] if Config.max_notes is not None else notes
+    spacing = max(float(Config.bounce_min_spacing), float(min_spacing_ms or 0))
+    return thin_notes(notes, spacing)
+
+
+def _serialize(bounce: Bounce) -> tuple[list[float], list[int], float, int]:
+    return bounce.square_pos.copy(), bounce.square_dir.copy(), bounce.time, bounce.bounce_dir
+
+
+def _conflict_warning(conflicts: int) -> str:
+    return f"Route overlap unavoidable at {conflicts} bounces" if conflicts else ""
 
 
 @dataclass
@@ -111,80 +152,60 @@ class StreamChunkResult:
     end_dir: list[int]
     elapsed_ms: float
     collision_conflicts: int = 0
+    start_time: float = 0.0
 
 
 class _WorkerMapSession:
+    """Bakes the whole song's route up front (so the planner can backtrack across it), then hands it out by chunk."""
+
     def __init__(
             self,
-            notes: list[float],
+            notes: list[MapNote],
             settings: dict,
             start_pos: list[float],
             start_dir: list[int],
+            min_spacing_ms: Optional[float] = None,
+            obstacles: Sequence[tuple[tuple[float, float, float, float], float]] = (),
+            obstacle_segments: Sequence[tuple[float, float, float, float]] = (),
+            start_time: float = 0.0,
     ):
+        started_at = perf_counter()
         for name, value in settings.items():
             setattr(Config, name, value)
-        notes = notes[:Config.max_notes] if Config.max_notes is not None else notes
-        self.notes = remove_too_close_values(notes, Config.bounce_min_spacing)
+        self.notes = _filter_map_notes(_as_map_notes(notes), min_spacing_ms)
         if not self.notes:
             raise MapLoadingFailureError("The map does not contain any playable notes")
+        self.start_time = float(start_time)
+        bounces, stats = plan_route(
+            [note[0] for note in self.notes], start_pos, start_dir, start_time=self.start_time,
+            obstacles=[(pygame.Rect(rect), timestamp) for rect, timestamp in obstacles],
+            obstacle_segments=obstacle_segments,
+        )
+        self.bounces = [_serialize(bounce) for bounce in bounces]
+        self.conflicts = stats.conflicts
+        self.bake_ms = (perf_counter() - started_at) * 1000
         self.index = 0
-        self.square = Square(*start_pos, *start_dir)
-        self.previous_time = 0.0
-        self.rng = random.Random(Config.seed)
-        self.recent_colliders = deque()
-        self.collision_index = SpatialHash(Config.spatial_cell_size)
-        self.collider_sequence = 0
-        self.collision_conflicts = 0
         self.chunk_seconds = max(float(Config.map_chunk_seconds), 1.0)
-        self.collision_retention = max(float(Config.map_retention_seconds) * 2, 10.0)
         self.initial_pos = start_pos.copy()
         self.initial_dir = start_dir.copy()
 
     def next_chunk(self, session_id: str, include_notes: bool) -> StreamChunkResult:
         started_at = perf_counter()
-        next_timestamp = self.notes[self.index]
-        chunk_start = floor(next_timestamp / self.chunk_seconds) * self.chunk_seconds
+        chunk_start = floor(self.bounces[self.index][2] / self.chunk_seconds) * self.chunk_seconds
         chunk_end = chunk_start + self.chunk_seconds
-        chunk_start_pos = self.square.pos.copy()
-        chunk_start_dir = self.square.dir.copy()
+        if self.index:
+            chunk_start_pos, chunk_start_dir = self.bounces[self.index - 1][0].copy(), self.bounces[self.index - 1][1].copy()
+        else:
+            chunk_start_pos, chunk_start_dir = self.initial_pos.copy(), self.initial_dir.copy()
         output = []
-
-        while self.index < len(self.notes) and self.notes[self.index] < chunk_end:
-            timestamp = self.notes[self.index]
-            elapsed = max(timestamp - self.previous_time, 0.0)
-            self.square.x += self.square.dir_x * Config.square_speed * elapsed
-            self.square.y += self.square.dir_y * Config.square_speed * elapsed
-
-            while self.recent_colliders and self.recent_colliders[0][0] < timestamp - self.collision_retention:
-                _, expired_key = self.recent_colliders.popleft()
-                self.collision_index.remove(expired_key)
-
-            preferred_axis = 1 if self.rng.random() * 100 < Config.direction_change_chance else 0
-            candidates = []
-            for axis in (preferred_axis, 1 - preferred_axis):
-                direction = self.square.dir.copy()
-                direction[axis] *= -1
-                candidate = Bounce(self.square.pos, direction, timestamp, axis)
-                collision_rect = candidate.get_collision_rect()
-                candidates.append((len(self.collision_index.query(collision_rect)), candidate, collision_rect))
-
-            collisions, selected, collision_rect = min(candidates, key=lambda item: item[0])
-            if collisions:
-                self.collision_conflicts += 1
-            self.square.dir = selected.square_dir.copy()
-            output.append((
-                selected.square_pos.copy(),
-                selected.square_dir.copy(),
-                selected.time,
-                selected.bounce_dir,
-            ))
-            self.collision_index.insert(self.collider_sequence, collision_rect)
-            self.recent_colliders.append((timestamp, self.collider_sequence))
-            self.collider_sequence += 1
-            self.previous_time = timestamp
+        while self.index < len(self.bounces) and self.bounces[self.index][2] < chunk_end:
+            output.append(self.bounces[self.index])
             self.index += 1
 
-        complete = self.index >= len(self.notes)
+        last_pos, last_dir, _, _ = output[-1]
+        elapsed_ms = (perf_counter() - started_at) * 1000
+        if include_notes:
+            elapsed_ms += self.bake_ms
         return StreamChunkResult(
             session_id=session_id,
             chunk=MapChunk(
@@ -194,18 +215,47 @@ class _WorkerMapSession:
                 start_pos=chunk_start_pos,
                 start_dir=chunk_start_dir,
             ),
-            all_notes=self.notes.copy() if include_notes else [],
+            all_notes=[note[0] for note in self.notes] if include_notes else [],
             start_pos=self.initial_pos.copy(),
             start_dir=self.initial_dir.copy(),
-            complete=complete,
-            end_pos=self.square.pos.copy(),
-            end_dir=self.square.dir.copy(),
-            elapsed_ms=(perf_counter() - started_at) * 1000,
-            collision_conflicts=self.collision_conflicts,
+            complete=self.index >= len(self.bounces),
+            end_pos=last_pos.copy(),
+            end_dir=last_dir.copy(),
+            elapsed_ms=elapsed_ms,
+            collision_conflicts=self.conflicts,
+            start_time=self.start_time,
         )
 
 
+    def tail_obstacles(self) -> list[tuple[tuple[int, int, int, int], float]]:
+        """The last pegs of this song, re-timed so the final one is at 0 s of the next song.
+
+        The final peg itself is left out: the next song starts touching it, just as a route leaves its own last peg."""
+        if not self.bounces:
+            return []
+        end = self.bounces[-1][2]
+        tail = []
+        for position, direction, timestamp, axis in reversed(self.bounces[:-1]):
+            rect = Bounce(position, direction, timestamp, axis).get_collision_rect()
+            tail.append((tuple(rect), timestamp - end))
+        return tail
+
+    def route_segments(self) -> list[tuple[float, float, float, float]]:
+        """Every travelled segment of this song, so the next song's pegs are never placed on it."""
+        points = [self.initial_pos] + [bounce[0] for bounce in self.bounces]
+        return [(*a, *b) for a, b in zip(points, points[1:])]
+
+
 _WORKER_MAP_SESSIONS: dict[str, _WorkerMapSession] = {}
+_WORKER_SESSION_TAILS: dict[str, list] = {}  # finished sessions -> their last pegs (for the next song's planner)
+
+
+def _finish_session(session_id: str):
+    session = _WORKER_MAP_SESSIONS.pop(session_id, None)
+    if session is not None:
+        _WORKER_SESSION_TAILS[session_id] = (session.tail_obstacles(), session.route_segments())
+        while len(_WORKER_SESSION_TAILS) > 4:
+            _WORKER_SESSION_TAILS.pop(next(iter(_WORKER_SESSION_TAILS)))
 
 
 def start_song_map_stream(
@@ -214,12 +264,17 @@ def start_song_map_stream(
         settings: dict,
         start_pos: list[float],
         start_dir: list[int],
+        previous_session_id: str = "",
+        start_time: float = 0.0,
 ) -> StreamChunkResult:
-    session = _WorkerMapSession(_read_notes(spec), settings, start_pos, start_dir)
+    obstacles, segments = _WORKER_SESSION_TAILS.get(previous_session_id, ([], [])) if previous_session_id else ([], [])
+    session = _WorkerMapSession(
+        _read_notes(spec), settings, start_pos, start_dir, spec.min_spacing_ms, obstacles, segments, start_time,
+    )
     _WORKER_MAP_SESSIONS[session_id] = session
     result = session.next_chunk(session_id, include_notes=True)
     if result.complete:
-        _WORKER_MAP_SESSIONS.pop(session_id, None)
+        _finish_session(session_id)
     return result
 
 
@@ -229,61 +284,12 @@ def continue_song_map_stream(session_id: str) -> StreamChunkResult:
         raise RuntimeError(f"Map stream session was lost: {session_id}")
     result = session.next_chunk(session_id, include_notes=False)
     if result.complete:
-        _WORKER_MAP_SESSIONS.pop(session_id, None)
+        _finish_session(session_id)
     return result
 
 
 def close_song_map_stream(session_id: str):
     _WORKER_MAP_SESSIONS.pop(session_id, None)
-
-
-def _generate_streaming_bounces(
-        notes: list[float], start_pos: list[float], start_dir: list[int], start_time: float = 0.0
-) -> tuple[list[Bounce], list[float], int]:
-    notes = notes[:Config.max_notes] if Config.max_notes is not None else notes
-    notes = remove_too_close_values(notes, Config.bounce_min_spacing)
-    if not notes:
-        raise MapLoadingFailureError("The map does not contain any playable notes")
-
-    rng = random.Random(Config.seed)
-    square = Square(*start_pos, *start_dir)
-    output = []
-    recent_colliders = deque()
-    collision_index = SpatialHash(Config.spatial_cell_size)
-    collision_conflicts = 0
-    previous_time = start_time
-    collision_retention = max(float(Config.map_retention_seconds) * 2, 10.0)
-
-    for timestamp in notes:
-        elapsed = max(timestamp - previous_time, 0.0)
-        square.x += square.dir_x * Config.square_speed * elapsed
-        square.y += square.dir_y * Config.square_speed * elapsed
-
-        while recent_colliders and recent_colliders[0][0] < timestamp - collision_retention:
-            _, expired_key = recent_colliders.popleft()
-            collision_index.remove(expired_key)
-
-        preferred_axis = 1 if rng.random() * 100 < Config.direction_change_chance else 0
-        axes = (preferred_axis, 1 - preferred_axis)
-        candidates = []
-        for axis in axes:
-            direction = square.dir.copy()
-            direction[axis] *= -1
-            candidate = Bounce(square.pos, direction, timestamp, axis)
-            collision_rect = candidate.get_collision_rect()
-            collisions = len(collision_index.query(collision_rect))
-            candidates.append((collisions, candidate, collision_rect))
-
-        collisions, selected, collision_rect = min(candidates, key=lambda item: item[0])
-        if collisions:
-            collision_conflicts += 1
-        square.dir = selected.square_dir.copy()
-        output.append(selected)
-        collider_key = len(output) - 1
-        collision_index.insert(collider_key, collision_rect)
-        recent_colliders.append((timestamp, collider_key))
-        previous_time = timestamp
-    return output, notes, collision_conflicts
 
 
 def prepare_song_map(
@@ -293,33 +299,31 @@ def prepare_song_map(
         start_dir: list[int],
 ) -> PreparedMap:
     notes = _read_notes(spec)
-    return prepare_notes_map(notes, settings, start_pos, start_dir)
+    return prepare_notes_map(notes, settings, start_pos, start_dir, min_spacing_ms=spec.min_spacing_ms)
 
 
 def prepare_notes_map(
-        notes: list[float],
+        notes,
         settings: dict,
         start_pos: list[float],
         start_dir: list[int],
         start_time: float = 0.0,
+        min_spacing_ms: Optional[float] = None,
+        obstacles: Sequence[tuple[pygame.Rect, float]] = (),
 ) -> PreparedMap:
+    """notes: MapNotes or plain timestamps. obstacles: (peg rect, time) already on screen (live regeneration)."""
     started_at = perf_counter()
     for name, value in settings.items():
         setattr(Config, name, value)
 
-    bounces, unhit_notes, collision_conflicts = _generate_streaming_bounces(
-        notes, start_pos, start_dir, start_time
-    )
-    used_fallback = False
-    warning = (
-        f"Used least-collision fallback for {collision_conflicts} bounces"
-        if collision_conflicts else ""
+    map_notes = _filter_map_notes(_as_map_notes(notes), min_spacing_ms)
+    if not map_notes:
+        raise MapLoadingFailureError("The map does not contain any playable notes")
+    bounces, stats = plan_route(
+        [note[0] for note in map_notes], start_pos, start_dir, start_time, obstacles=obstacles
     )
 
-    serialized = [
-        (bounce.square_pos.copy(), bounce.square_dir.copy(), bounce.time, bounce.bounce_dir)
-        for bounce in bounces
-    ]
+    serialized = [_serialize(bounce) for bounce in bounces]
     chunk_seconds = max(float(settings.get("map_chunk_seconds", 15.0)), 1.0)
     chunks: list[MapChunk] = []
     for bounce in serialized:
@@ -330,13 +334,13 @@ def prepare_notes_map(
 
     return PreparedMap(
         bounces=serialized,
-        unhit_notes=unhit_notes,
+        unhit_notes=[note[0] for note in map_notes],
         start_pos=start_pos.copy(),
         start_dir=start_dir.copy(),
         chunks=chunks,
         generation_ms=(perf_counter() - started_at) * 1000,
-        used_fallback=used_fallback,
-        warning=warning,
+        used_fallback=False,
+        warning=_conflict_warning(stats.conflicts),
     )
 
 
@@ -345,6 +349,7 @@ class TimedAudio:
     data: bytes
     extension: str
     elapsed_ms: float
+    duration: float = 0.0  # playback length in seconds, 0 when unknown
 
     def __getitem__(self, index: int):
         return (self.data, self.extension)[index]
@@ -376,11 +381,47 @@ class PrefetchSlot:
     map_inflight: bool = False
     map_complete: bool = False
     error: str = ""
+    cancelled: bool = False  # dropped from the queue; late worker results are ignored
+    last_bounce_time: Optional[float] = None
+
+def _ogg_duration(data: bytes) -> float:
+    """Length from the last page's granule position (no decoding)."""
+    head = data.find(b"\x01vorbis")
+    if head >= 0:
+        rate, pre_skip = int.from_bytes(data[head + 12:head + 16], "little"), 0
+    else:
+        head = data.find(b"OpusHead")
+        if head < 0:
+            return 0.0
+        rate, pre_skip = 48_000, int.from_bytes(data[head + 10:head + 12], "little")
+    last = data.rfind(b"OggS")
+    if last < 0 or rate <= 0:
+        return 0.0
+    granule = int.from_bytes(data[last + 6:last + 14], "little", signed=True)
+    return max(granule - pre_skip, 0) / rate
+
+
+def audio_duration(data: bytes, extension: str) -> float:
+    """Playback length of a song's audio in seconds; 0.0 when it cannot be told."""
+    try:
+        extension = extension.lower()
+        if extension in (".mid", ".midi"):
+            import mido
+            return float(mido.MidiFile(file=BytesIO(data)).length)
+        if extension == ".ogg":
+            return _ogg_duration(data)
+        if pygame.mixer.get_init():
+            return float(pygame.mixer.Sound(file=BytesIO(data)).get_length())
+    except Exception:
+        pass
+    return 0.0
+
 
 def read_song_audio_timed(spec: SongSpec) -> TimedAudio:
     started_at = perf_counter()
     data, extension = read_song_audio(spec)
-    return TimedAudio(data, extension, (perf_counter() - started_at) * 1000)
+    duration = audio_duration(data, extension)
+    return TimedAudio(data, extension, (perf_counter() - started_at) * 1000, duration)
 
 
 class PlaylistController:
@@ -399,6 +440,9 @@ class PlaylistController:
         self._map_executor: Optional[ProcessPoolExecutor] = None
         self._audio_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-preload")
         self._lock = Lock()
+        # optional: picks the song after base_index (live mode queue); default is the next song in the list
+        self.next_index_provider = None
+        self._drop_on_rebuild = 0
 
     @property
     def next_index(self) -> int:
@@ -424,13 +468,20 @@ class PlaylistController:
         if self._map_executor is None:
             self._map_executor = ProcessPoolExecutor(max_workers=1)
 
-    def _invalidate_streams(self):
-        old_slots = [slot for slot in [self.active_slot, *self.slots] if slot is not None]
-        self._generation += 1
-        if self._map_executor is not None:
-            for slot in old_slots:
-                if slot.map_started and not slot.map_complete:
+    def _invalidate_streams(self, keep_active: bool = False):
+        """Drop queued streams. keep_active leaves the playing song's stream running."""
+        if keep_active:
+            old_slots = list(self.slots)
+        else:
+            old_slots = [slot for slot in [self.active_slot, *self.slots] if slot is not None]
+            self._generation += 1
+        for slot in old_slots:
+            slot.cancelled = True
+            if self._map_executor is not None and slot.map_started and not slot.map_complete:
+                try:
                     self._map_executor.submit(close_song_map_stream, slot.session_id)
+                except Exception:  # a crashed worker pool must not stop shutdown (settings are saved after it)
+                    pass
 
     def _new_slot(self, index: int) -> PrefetchSlot:
         spec = song_to_spec(self.songs[index])
@@ -444,11 +495,24 @@ class PlaylistController:
             session_id=uuid4().hex,
         )
 
-    def _candidate_indices(self, base_index: int, count: int) -> list[int]:
+    def _candidate_indices(self, base_index: int, count: int, reuse: tuple = ()) -> list[int]:
         if not self.songs:
             return []
+        if self.next_index_provider is not None:
+            # songs already taken from the provider keep their place when the queue is rebuilt
+            picked = [index for index in reuse if 0 <= index < len(self.songs)][:count]
+            while len(picked) < count:
+                picked.append(self._pick_after(picked[-1] if picked else base_index))
+            return picked
         count = min(count, len(self.songs))
         return [(base_index + offset) % len(self.songs) for offset in range(1, count + 1)]
+
+    def _pick_after(self, base_index: int) -> int:
+        if self.next_index_provider is not None:
+            index = int(self.next_index_provider(base_index))
+            if 0 <= index < len(self.songs):
+                return index
+        return (base_index + 1) % len(self.songs)
 
     def _set_stream_error(self, slot: PrefetchSlot, exc: Exception):
         slot.error = str(exc)
@@ -463,9 +527,13 @@ class PlaylistController:
             slot: PrefetchSlot,
             start_pos: list[float],
             start_dir: list[int],
+            previous: Optional[PrefetchSlot] = None,
+            start_time: Optional[float] = None,
     ):
-        if slot.map_started:
+        if slot.map_started or slot.cancelled:
             return
+        if start_time is None:
+            start_time = self._continuation_start_time(previous)
         self._ensure_map_executor()
         slot.map_started = True
         slot.map_inflight = True
@@ -479,6 +547,8 @@ class PlaylistController:
             map_settings_snapshot(),
             start_pos.copy(),
             start_dir.copy(),
+            previous.session_id if previous is not None else "",
+            start_time,
         )
         future.add_done_callback(
             lambda completed: self._finish_stream_chunk(slot, completed, generation, first=True)
@@ -504,7 +574,7 @@ class PlaylistController:
             generation: int,
             first: bool,
     ):
-        if generation != self._generation:
+        if generation != self._generation or slot.cancelled:
             return
         try:
             result: StreamChunkResult = future.result()
@@ -517,12 +587,11 @@ class PlaylistController:
             slot.map_ms += result.elapsed_ms
             slot.end_pos = result.end_pos.copy()
             slot.end_dir = result.end_dir.copy()
+            if result.chunk.bounces:
+                slot.last_bounce_time = result.chunk.bounces[-1][2]
             if first:
                 slot.all_notes = result.all_notes.copy()
-                warning = (
-                    f"Used least-collision fallback for {result.collision_conflicts} bounces"
-                    if result.collision_conflicts else ""
-                )
+                warning = _conflict_warning(result.collision_conflicts)
                 prepared = PreparedMap(
                     bounces=list(result.chunk.bounces),
                     unhit_notes=slot.all_notes.copy(),
@@ -533,6 +602,7 @@ class PlaylistController:
                     warning=warning,
                     complete=result.complete,
                     stream_slot=slot,
+                    start_time=result.start_time,
                 )
                 slot.map_future.set_result(prepared)
             else:
@@ -548,6 +618,21 @@ class PlaylistController:
         else:
             self._submit_stream_continue(slot)
 
+    @staticmethod
+    def _continuation_start_time(previous: Optional[PrefetchSlot]) -> float:
+        """The next song's route starts this long before its own 0 s: the time between the previous song's last
+        bounce and the end of its audio, which the square spends gliding on instead of waiting."""
+        if previous is None or not previous.end_pos or not previous.audio_future.done():
+            return 0.0
+        try:
+            duration = float(getattr(previous.audio_future.result(), "duration", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+        last_time = previous.last_bounce_time
+        if duration <= 0.0 or last_time is None:
+            return 0.0
+        return -max(duration - last_time, 0.0)
+
     def _start_next_waiting_slot(self, completed_slot: PrefetchSlot):
         slots = list(self.slots)
         if completed_slot is self.active_slot:
@@ -558,7 +643,7 @@ class PlaylistController:
         else:
             candidate = None
         if candidate is not None and not candidate.map_started:
-            self._submit_stream_start(candidate, completed_slot.end_pos, completed_slot.end_dir)
+            self._submit_stream_start(candidate, completed_slot.end_pos, completed_slot.end_dir, completed_slot)
 
     def prepare_current(self, start_pos: list[float], start_dir: list[int]) -> PreparedMap:
         self._invalidate_streams()
@@ -570,16 +655,36 @@ class PlaylistController:
         # The first track is loaded synchronously elsewhere, so discard the duplicate preload.
         return prepared
 
-    def prepare_ahead(self, start_pos: list[float], start_dir: list[int]):
-        self._invalidate_streams()
-        self.active_slot = None
+    def prepare_ahead(
+            self,
+            start_pos: list[float],
+            start_dir: list[int],
+            keep_active: bool = False,
+            start_time: float = 0.0,
+    ):
+        """Rebuild the queue after current_index. keep_active keeps the playing song streaming; the next map then
+        starts where the playing song's finished map ends (right away if it is already complete)."""
+        keep_active = keep_active and self.active_slot is not None and not self.active_slot.error
+        reuse = tuple(slot.index for slot in list(self.slots)[self._drop_on_rebuild:])
+        self._drop_on_rebuild = 0
+        self._invalidate_streams(keep_active=keep_active)
+        if not keep_active:
+            self.active_slot = None
         self.slots.clear()
         self.last_error = ""
         count = max(int(Config.playlist_prefetch_count), 1)
-        for index in self._candidate_indices(self.current_index, count):
+        for index in self._candidate_indices(self.current_index, count, reuse):
             self.slots.append(self._new_slot(index))
-        if self.slots:
-            self._submit_stream_start(self.slots[0], start_pos, start_dir)
+        if not self.slots:
+            return
+        if keep_active:
+            active = self.active_slot
+            if active.map_complete and active.complete_future.done():
+                end_pos, end_dir = active.complete_future.result()
+                self._submit_stream_start(self.slots[0], end_pos, end_dir, active)
+            # otherwise _start_next_waiting_slot starts it when the playing song's stream completes
+            return
+        self._submit_stream_start(self.slots[0], start_pos, start_dir, start_time=start_time)
 
     def prepare_next(self, start_pos: list[float], start_dir: list[int]):
         self.prepare_ahead(start_pos, start_dir)
@@ -675,7 +780,7 @@ class PlaylistController:
             return
         timed_audio: TimedAudio = slot.audio_future.result()
         released = Future()
-        released.set_result(TimedAudio(b"", timed_audio.extension, timed_audio.elapsed_ms))
+        released.set_result(TimedAudio(b"", timed_audio.extension, timed_audio.elapsed_ms, timed_audio.duration))
         slot.audio_future = released
 
     def ensure_prefetch(self, current_end_pos: list[float], current_end_dir: list[int]):
@@ -685,7 +790,7 @@ class PlaylistController:
         anchor = self.slots[-1] if self.slots else self.active_slot
         base_index = anchor.index if anchor is not None else self.current_index
         while len(self.slots) < target:
-            index = (base_index + 1) % len(self.songs)
+            index = self._pick_after(base_index)
             slot = self._new_slot(index)
             self.slots.append(slot)
             base_index = index
@@ -693,16 +798,38 @@ class PlaylistController:
         first = self.slots[0] if self.slots else None
         if first is None or first.map_started:
             return
-        if anchor is not None and anchor is not first:
-            if not anchor.complete_future.done() or self._future_error(anchor.complete_future, ""):
+        # the next map starts where the playing song's map ends, so wait for that map to finish streaming
+        previous = self.active_slot
+        if previous is not None and previous.map_started:
+            if not previous.complete_future.done() or self._future_error(previous.complete_future, ""):
                 return
-            start_pos, start_dir = anchor.complete_future.result()
+            start_pos, start_dir = previous.complete_future.result()
         else:
+            previous = None
             start_pos, start_dir = current_end_pos, current_end_dir
-        self._submit_stream_start(first, start_pos, start_dir)
+        self._submit_stream_start(first, start_pos, start_dir, previous)
 
-    def refresh_next_map(self, start_pos: list[float], start_dir: list[int]):
-        self.prepare_ahead(start_pos, start_dir)
+    def refresh_next_map(self, start_pos: list[float], start_dir: list[int], start_time: float = 0.0):
+        self.prepare_ahead(start_pos, start_dir, start_time=start_time)
+
+    def active_duration(self) -> float:
+        """Audio length of the playing song (0.0 when unknown)."""
+        slot = self.active_slot
+        if slot is None or not slot.audio_future.done():
+            return 0.0
+        try:
+            return float(getattr(slot.audio_future.result(), "duration", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+
+    def peek_next_map(self) -> Optional[tuple[PreparedMap, list[MapChunk]]]:
+        """The next song's map so far (first chunk + queued chunks), without consuming anything."""
+        if not self.slots or not self.slots[0].map_future.done() or self.first_error():
+            return None
+        slot = self.slots[0]
+        with self._lock:
+            queued = list(slot.chunk_queue)
+        return slot.map_future.result(), queued
 
     def skip_failed(
             self,
@@ -715,11 +842,13 @@ class PlaylistController:
         failed = self.slots[0]
         self.last_skipped_song = getattr(failed.song, "name", str(failed.song))
         self.current_index = failed.index
+        self._drop_on_rebuild = 1  # the failed song is not reused
         if restart_map_worker and self._map_executor is not None:
             self._generation += 1
             self._map_executor.shutdown(wait=False, cancel_futures=True)
             self._map_executor = None
-        self.prepare_ahead(start_pos, start_dir)
+        # a failed *next* track must not cut the map of the song that is still playing
+        self.prepare_ahead(start_pos, start_dir, keep_active=not restart_map_worker)
         return failed.song
 
     def metrics(self) -> dict:

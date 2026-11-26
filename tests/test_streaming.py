@@ -90,7 +90,7 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(clean["square_speed"], 2_000)
         self.assertEqual(clean["volume"], 70)
         self.assertEqual(clean["camera_mode"], 4)
-        self.assertEqual(clean["square_core_shape"], "diamond")
+        self.assertEqual(clean["square_core_shape"], "none")
         self.assertEqual(clean["square_core_color"], "accent")
         self.assertTrue(clean["performance_hud"])
         self.assertEqual(clean["shorts_segment_duration"], 30)
@@ -110,7 +110,7 @@ class StreamingTests(unittest.TestCase):
 
                 self.assertIn("defaults restored", corrections[0])
                 self.assertEqual(normalized["square_speed"], 600)
-                self.assertEqual(normalized["square_core_shape"], "diamond")
+                self.assertEqual(normalized["square_core_shape"], "none")
         finally:
             for name, value in previous.items():
                 setattr(Config, name, value)
@@ -529,6 +529,10 @@ class StreamingTests(unittest.TestCase):
                 return None
 
             @staticmethod
+            def peek_next_map():
+                return None
+
+            @staticmethod
             def metrics():
                 return {"ready": 0, "queued": 1, "pending_ms": 10, "map_ms": 0, "audio_ms": 0}
 
@@ -693,7 +697,6 @@ class StreamingTests(unittest.TestCase):
             self.assertLessEqual(max(frame_changes), 1)
             self.assertEqual(counts[-1], 0)
             self.assertEqual(len(game.geometry_visible_since), 0)
-            self.assertEqual(len(game.world.geometry_index), 0)
         finally:
             game.shutdown()
             Config.map_retention_seconds = previous_retention
@@ -712,19 +715,11 @@ class StreamingTests(unittest.TestCase):
         finally:
             Config.map_fade_seconds = previous_fade
 
-    def test_visible_peg_count_adapts_to_fast_music(self):
+    def test_next_ten_pegs_are_always_drawn_for_fast_music(self):
         previous = {
-            "peg_visible_min": Config.peg_visible_min,
             "peg_visible_max": Config.peg_visible_max,
-            "peg_density_window_seconds": Config.peg_density_window_seconds,
-            "peg_preview_seconds": Config.peg_preview_seconds,
-            "peg_overlap_padding": Config.peg_overlap_padding,
         }
-        Config.peg_visible_min = 3
-        Config.peg_visible_max = 6
-        Config.peg_density_window_seconds = 1.0
-        Config.peg_preview_seconds = 0.5
-        Config.peg_overlap_padding = 0
+        Config.peg_visible_max = 10
         game = Game()
         try:
             game.world.rectangles = [
@@ -734,43 +729,45 @@ class StreamingTests(unittest.TestCase):
             game.world.colors = [(255, 255, 255)] * 20
             game.safe_areas = [rect.copy() for rect in game.world.rectangles]
             game.safe_area_times = game.world.collision_times.copy()
+            # loaded but never off screen yet: only the forced next pegs may show
+            game.geometry_visible_since = [None] * len(game.world.rectangles)
+            game.safe_area_visible_since = [None] * len(game.safe_areas)
 
             geometry, safe_areas, next_peg, limit = game._visible_map_records(0.0)
 
-            self.assertEqual(limit, 6)
-            self.assertEqual(len(geometry), 6)
-            self.assertEqual(len(safe_areas), 6)
+            self.assertEqual(limit, 10)
+            self.assertEqual(geometry, set(range(10)))
+            self.assertEqual(len(safe_areas), 10)
             self.assertEqual(next_peg, 0)
         finally:
             game.shutdown()
             for name, value in previous.items():
                 setattr(Config, name, value)
 
-    def test_visible_peg_count_stays_small_for_slow_music(self):
+    def test_next_ten_pegs_are_always_drawn_for_slow_music(self):
         previous_min = Config.peg_visible_min
         previous_max = Config.peg_visible_max
-        previous_padding = Config.peg_overlap_padding
-        Config.peg_visible_min = 3
-        Config.peg_visible_max = 6
-        Config.peg_overlap_padding = 0
+        Config.peg_visible_max = 10
         game = Game()
         try:
-            game.world.rectangles = [pygame.Rect(index * 100, 0, 10, 20) for index in range(5)]
-            game.world.collision_times = [1.0, 2.0, 3.0, 4.0, 5.0]
-            game.world.colors = [(255, 255, 255)] * 5
+            game.world.rectangles = [pygame.Rect(index * 100, 0, 10, 20) for index in range(15)]
+            game.world.collision_times = [float(index + 1) for index in range(15)]  # one note per second
+            game.world.colors = [(255, 255, 255)] * 15
             game.safe_areas = [rect.copy() for rect in game.world.rectangles]
             game.safe_area_times = game.world.collision_times.copy()
+            # loaded but never off screen yet: only the forced next pegs may show
+            game.geometry_visible_since = [None] * len(game.world.rectangles)
+            game.safe_area_visible_since = [None] * len(game.safe_areas)
 
             geometry, _, next_peg, limit = game._visible_map_records(0.0)
 
-            self.assertEqual(limit, 3)
-            self.assertEqual(geometry, {0, 1, 2})
+            self.assertEqual(limit, 10)
+            self.assertEqual(geometry, set(range(10)))
             self.assertEqual(next_peg, 0)
         finally:
             game.shutdown()
             Config.peg_visible_min = previous_min
             Config.peg_visible_max = previous_max
-            Config.peg_overlap_padding = previous_padding
 
     def test_next_peg_world_position_tracks_music_time(self):
         game = Game()
@@ -952,13 +949,11 @@ class StreamingTests(unittest.TestCase):
             for name, value in previous.items():
                 setattr(Config, name, value)
 
-    def test_overlapping_future_pegs_never_hide_immediate_target(self):
+    def test_close_future_pegs_are_not_hidden(self):
         previous_min = Config.peg_visible_min
         previous_max = Config.peg_visible_max
-        previous_padding = Config.peg_overlap_padding
         Config.peg_visible_min = 3
         Config.peg_visible_max = 3
-        Config.peg_overlap_padding = 8
         game = Game()
         try:
             game.world.rectangles = [
@@ -971,26 +966,21 @@ class StreamingTests(unittest.TestCase):
             game.world.colors = [(255, 255, 255)] * 4
             game.safe_areas = [rect.copy() for rect in game.world.rectangles]
             game.safe_area_times = game.world.collision_times.copy()
+            # loaded but never off screen yet: only the forced next pegs may show
+            game.geometry_visible_since = [None] * len(game.world.rectangles)
+            game.safe_area_visible_since = [None] * len(game.safe_areas)
 
             geometry, _, next_peg, _ = game._visible_map_records(0.0)
 
             self.assertEqual(next_peg, 0)
             self.assertIn(0, geometry)
-            self.assertNotIn(1, geometry)
-            self.assertEqual(geometry, {0, 2, 3})
+            self.assertEqual(geometry, {0, 1, 2})  # 1 sits close to 0 but is still a peg to hit
         finally:
             game.shutdown()
             Config.peg_visible_min = previous_min
             Config.peg_visible_max = previous_max
-            Config.peg_overlap_padding = previous_padding
 
-    def test_only_two_recent_past_pegs_remain_visible(self):
-        previous_past_max = Config.peg_visible_past_max
-        previous_past_fade = Config.peg_past_fade_seconds
-        previous_padding = Config.peg_overlap_padding
-        Config.peg_visible_past_max = 2
-        Config.peg_past_fade_seconds = 0.6
-        Config.peg_overlap_padding = 0
+    def test_passed_pegs_stay_visible_until_pruned_off_screen(self):
         game = Game()
         try:
             game.world.rectangles = [pygame.Rect(index * 100, 0, 10, 20) for index in range(4)]
@@ -1002,12 +992,9 @@ class StreamingTests(unittest.TestCase):
             geometry, _, next_peg, _ = game._visible_map_records(10.0)
 
             self.assertEqual(next_peg, 3)
-            self.assertEqual(geometry, {1, 2, 3})
+            self.assertEqual(geometry, {0, 1, 2, 3})
         finally:
             game.shutdown()
-            Config.peg_visible_past_max = previous_past_max
-            Config.peg_past_fade_seconds = previous_past_fade
-            Config.peg_overlap_padding = previous_padding
 
     def test_game_starts_playlist_and_schedules_next_track(self):
         previous_max_notes = Config.max_notes
@@ -1545,22 +1532,14 @@ class StreamingTests(unittest.TestCase):
 
     def test_live_overlay_changes_peg_readability_settings(self):
         previous_max = Config.peg_visible_max
-        previous_spacing = Config.peg_overlap_padding
-        previous_guide = Config.peg_guide_line
         game = Game()
         try:
             LiveConfigOverlay._adjust("peg_visible_max", -1, game)
-            LiveConfigOverlay._adjust("peg_overlap_padding", 1, game)
-            LiveConfigOverlay._adjust("peg_guide_line", 1, game)
 
             self.assertEqual(Config.peg_visible_max, max(Config.peg_visible_min, previous_max - 1))
-            self.assertEqual(Config.peg_overlap_padding, min(24, previous_spacing + 2))
-            self.assertEqual(Config.peg_guide_line, not previous_guide)
         finally:
             game.shutdown()
             Config.peg_visible_max = previous_max
-            Config.peg_overlap_padding = previous_spacing
-            Config.peg_guide_line = previous_guide
 
 
 if __name__ == "__main__":

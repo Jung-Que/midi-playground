@@ -22,7 +22,9 @@ class Song:
         self.name = name
         self.version = version  # metadata format version, not the map version
         self.music_offset = 0  # put integer that represents milliseconds, negative is music is before
+        self.min_spacing_ms = None  # optional per-song floor for Config.bounce_min_spacing
         self.local_only = local_only
+        self.categories: list[str] = []  # metadata 'category' / 'categories'; a song may be in several
 
         self.anim = 0
         col = pygame.Color(229, 97, 196)
@@ -139,6 +141,11 @@ def make_song_from_zip(fpath: str, local_only: bool = False) -> Song:
         )
         if metadata.get("version") >= 2:
             new_song.music_offset = metadata.get("music_offset", 0)
+            spacing = metadata.get("bounce_min_spacing")
+            if isinstance(spacing, (int, float)) and 0 < spacing <= 200:
+                new_song.min_spacing_ms = float(spacing)
+        from live import categories_from_metadata
+        new_song.categories = categories_from_metadata(metadata)
         return new_song
 
 
